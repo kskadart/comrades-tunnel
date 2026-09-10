@@ -1,0 +1,5 @@
+# CIDR blocks that must NOT go through the personal VPN: corporate VPN
+# gateway IPs and corporate public netblocks (so the corporate VPN client
+# itself, and anything already routed by it, keeps working).
+# One CIDR (or /32 host) per line.
+203.0.113.0/24

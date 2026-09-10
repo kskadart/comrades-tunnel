@@ -1,0 +1,5 @@
+# Known corporate hosts used by bin/check-split.sh to verify routing, and
+# also resolved by bin/gen-amnezia-sites.py so their IPs are excluded from
+# the personal VPN site list (same as direct-domains.txt).
+# One hostname per line.
+git.corp.example

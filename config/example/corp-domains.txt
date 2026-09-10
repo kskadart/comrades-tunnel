@@ -1,0 +1,5 @@
+# Corporate DNS zones served by split-horizon DNS.
+# One domain per line. install-resolvers.sh renders /etc/resolver/<domain>
+# for each of these, pointing at the nameservers in corp-dns.txt.
+corp.example
+intra.example

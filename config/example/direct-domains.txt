@@ -1,0 +1,5 @@
+# Domains that must bypass the personal VPN entirely (e.g. services that
+# geo-block or otherwise misbehave when seen from a foreign exit IP).
+# Resolved at generation time; their IPv4 addresses are excluded from the
+# Amnezia site list. One domain per line.
+gov.example

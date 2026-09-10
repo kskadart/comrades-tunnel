@@ -1,0 +1,4 @@
+# Corporate DNS resolver IPs, reachable only via the corporate VPN tunnel.
+# One IP per line; install-resolvers.sh writes one "nameserver <ip>" line
+# per entry, in order, into every /etc/resolver/<domain> file.
+10.0.0.53
