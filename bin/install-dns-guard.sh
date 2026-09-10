@@ -3,28 +3,37 @@
 # VPN client's rewrite of the primary network service's DNS servers.
 #
 # The daemon script and its conf are copied to a root-owned location under
-# /usr/local/lib/comrades-tunnel/ instead of being run in place from this
-# repo checkout, because a LaunchDaemon runs as root (at RunAtLoad and on
-# every matching WatchPaths event) and its ProgramArguments points at a
-# fixed path on disk: if that path were inside the user's home directory,
+# /Library/Application Support/comrades-tunnel/ instead of being run in place
+# from this repo checkout, because a LaunchDaemon runs as root (at RunAtLoad
+# and on every matching WatchPaths event) and its ProgramArguments points at
+# a fixed path on disk: if that path were inside the user's home directory,
 # anything able to write there as that user -- a bug in an unrelated tool,
 # a compromised dependency, malware -- could rewrite the script and have it
-# executed as root the next time the daemon fires. Copying it to a
-# root-owned path with 755/644 permissions at --apply time closes that
-# privilege-escalation route; only root can change what the daemon runs.
+# executed as root the next time the daemon fires. Copying it to a 755/644
+# path at --apply time closes that privilege-escalation route; only root can
+# change what the daemon runs.
+#
+# Merely making the leaf directory root-owned is not enough: directory write
+# permission lets its owner rename/delete any entry in it regardless of that
+# entry's own ownership, so the whole ancestor chain must be fully root-owned
+# and non-user-writable. /usr/local is the classic trap -- Homebrew makes it
+# writable by the unprivileged user -- which is exactly why we do NOT install
+# there. The installer verifies the ancestor chain with assert_safe_path
+# instead of assuming it: --dry-run reports, --apply hard-refuses.
 #
 # Renders:
-#   /usr/local/lib/comrades-tunnel/dns-guard.sh    (copy of bin/dns-guard.sh)
-#   /usr/local/lib/comrades-tunnel/dns-guard.conf  (KEY=VALUE, from
-#                                                    DIR/dns-guard.txt +
-#                                                    DIR/corp-dns.txt)
+#   /Library/Application Support/comrades-tunnel/dns-guard.sh    (copy of
+#       bin/dns-guard.sh)
+#   /Library/Application Support/comrades-tunnel/dns-guard.conf  (KEY=VALUE,
+#       from DIR/dns-guard.txt + DIR/corp-dns.txt)
 #   /Library/LaunchDaemons/dev.comrades-tunnel.dns-guard.plist
 #
 # Default action is --dry-run: prints each rendered file and a diff against
 # whatever is currently installed (or "would create"), and validates the
 # rendered plist with `plutil -lint`. Nothing is written or executed.
 # --apply performs the install with sudo and (re)loads the daemon.
-# --uninstall stops the daemon and removes the three installed files.
+# --uninstall stops the daemon and removes the installed files (including a
+# legacy /usr/local/lib/comrades-tunnel install, if present).
 #
 # Usage: install-dns-guard.sh [--config DIR] [--dry-run|--apply|--uninstall]
 
@@ -65,7 +74,8 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-LIB_DIR="/usr/local/lib/comrades-tunnel"
+LIB_DIR="/Library/Application Support/comrades-tunnel"
+LEGACY_LIB_DIR="/usr/local/lib/comrades-tunnel"
 GUARD_SCRIPT_SRC="$SCRIPT_DIR/dns-guard.sh"
 GUARD_SCRIPT_DST="$LIB_DIR/dns-guard.sh"
 GUARD_CONF_DST="$LIB_DIR/dns-guard.conf"
@@ -84,13 +94,54 @@ normalize_list() {
     printf '%s\n' "$1" | tr '\n' ' ' | tr -s '[:space:]' ' ' | sed -e 's/^ //' -e 's/ $//'
 }
 
+# Verify that <path> and every already-existing ancestor up to / is fully
+# root-owned with neither group-write nor other-write permission. Directory
+# write permission lets the owning user rename/delete any entry inside,
+# regardless of that entry's own ownership, so a user-writable ancestor lets a
+# non-root user replace exactly what the root daemon executes -- escalation to
+# root. In --dry-run this reports one line per component; in --apply it
+# hard-refuses (exit 1) before any sudo write.
+assert_safe_path() {
+    p=$1
+    while :; do
+        if [ -e "$p" ] || [ "$p" = "/" ]; then
+            owner=$(stat -f '%Su' "$p")
+            mode=$(stat -f '%Sp' "$p")
+            gwrite=$(printf '%s' "$mode" | cut -c6)   # group "write"
+            owrite=$(printf '%s' "$mode" | cut -c9)   # other "write"
+            if [ "$owner" = "root" ] && [ "$gwrite" != "w" ] && [ "$owrite" != "w" ]; then
+                [ "$ACTION" != "apply" ] && echo "ok:      $p ($owner $mode)"
+            elif [ "$ACTION" = "apply" ]; then
+                echo "UNSAFE: $p ($owner $mode)" >&2
+                echo "Refusing to install: a user-writable ancestor ($p) lets a non-root user replace what the root daemon executes." >&2
+                exit 1
+            else
+                echo "UNSAFE: $p ($owner $mode)"
+            fi
+        fi
+        [ "$p" = "/" ] && break
+        p=$(dirname "$p")
+    done
+}
+
 if [ "$ACTION" = "uninstall" ]; then
     echo "Uninstalling $PLIST_LABEL"
     sudo launchctl bootout "system/$PLIST_LABEL" 2>/dev/null || true
-    sudo rm -f "$PLIST_DST" "$GUARD_SCRIPT_DST" "$GUARD_CONF_DST"
-    echo "Removed: $PLIST_DST"
-    echo "Removed: $GUARD_SCRIPT_DST"
-    echo "Removed: $GUARD_CONF_DST"
+    for f in "$PLIST_DST" "$GUARD_SCRIPT_DST" "$GUARD_CONF_DST"; do
+        if [ -e "$f" ]; then
+            sudo rm -f "$f"
+            echo "Removed: $f"
+        else
+            echo "Already absent: $f"
+        fi
+    done
+    if [ -d "$LEGACY_LIB_DIR" ]; then
+        sudo rm -f "$LEGACY_LIB_DIR/dns-guard.sh" "$LEGACY_LIB_DIR/dns-guard.conf"
+        sudo rmdir "$LEGACY_LIB_DIR" 2>/dev/null || true
+        echo "Removed legacy: $LEGACY_LIB_DIR (dns-guard.sh, dns-guard.conf)"
+    else
+        echo "Legacy $LEGACY_LIB_DIR: already absent"
+    fi
     exit 0
 fi
 
@@ -123,6 +174,11 @@ fi
 if [ -z "$MODE" ]; then
     MODE="corp-only"
 fi
+
+echo "Checking path safety:"
+assert_safe_path "$LIB_DIR"
+assert_safe_path "$(dirname "$PLIST_DST")"
+assert_safe_path "$(dirname "$LOG_FILE")"
 
 TMP_CONF=$(mktemp)
 TMP_PLIST=$(mktemp)
