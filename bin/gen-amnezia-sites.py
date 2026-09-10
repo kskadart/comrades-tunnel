@@ -14,6 +14,15 @@ personal VPN:
   - the nameservers of the primary system DNS resolver (resolver #1 in
     `scutil --dns`), so DNS itself never goes through the tunnel
 
+By default each direct-domains.txt entry is *expanded* to the whole
+autonomous system (AS) that owns it when that is safe: the domain is
+resolved, the first IP is looked up in RIPEstat to find the owning ASN(s),
+and if the ASN is registered to country RU (per the RIPE NCC delegated
+file) and announces a bounded number of IPv4 prefixes, then ALL of those
+prefixes are excluded -- not just the resolved /32s. This covers
+CDN/load-balancer ranges whose member addresses change over time. See the
+"--no-asn" flag and the direct-domains.txt syntax below.
+
 The corporate 10.x/172.16.x prefixes pushed into the Check Point tunnel and
 the excluded RFC 1918 space overlap by design -- longest-prefix-match
 routing keeps corporate traffic on the corporate tunnel regardless of what
@@ -25,13 +34,21 @@ amnezia-vpn/amnezia-client, client/core/controllers/ipSplitTunnelingController.c
     build/amnezia-sites.txt    -- one CIDR per line, for human review
 
 Usage:
-    gen-amnezia-sites.py [--config DIR] [--dry-run]
+    gen-amnezia-sites.py [--config DIR] [--dry-run] [--no-asn] [--refresh]
+
+direct-domains.txt syntax (optional second token after the domain):
+    <domain>            expand to whole ASN when safe (RU-country, under cap)
+    <domain> asn        force expansion to the whole ASN (ignore cap/country rule)
+    <domain> ip         force IP-only expansion (only the resolved /32s)
 """
 import argparse
 import ipaddress
+import json
 import socket
 import subprocess
 import sys
+import time
+import urllib.request
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -64,6 +81,15 @@ SPECIAL_RANGES = [
 FULL_IPV4 = ipaddress.ip_network("0.0.0.0/0")
 MAX_ADDR = 2 ** 32
 
+# ASN expansion tunables.
+ASN_MAX_PREFIXES = 200  # cap: bigger ISPs announce thousands of prefixes
+CACHE_AGE_SECONDS = 7 * 24 * 3600  # reuse cache / RIPE file inside a week
+HTTP_TIMEOUT = 20  # seconds per request
+USER_AGENT = "comrades-tunnel/1.0"
+RIPENCC_URL = "https://ftp.ripe.net/pub/stats/ripencc/delegated-ripencc-extended-latest"
+NETWORK_INFO_URL = "https://stat.ripe.net/data/network-info/data.json?resource={ip}&sourceapp=comrades-tunnel"
+ANNOUNCED_PREFIXES_URL = "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS{asn}&sourceapp=comrades-tunnel"
+
 
 def read_list(path: Path) -> list:
     """Read a config file: one entry per line, '#' comments, blanks skipped."""
@@ -77,6 +103,31 @@ def read_list(path: Path) -> list:
     return out
 
 
+def read_direct_domains(path: Path) -> list:
+    """Read direct-domains.txt. Returns a list of (domain, override) tuples.
+
+    Each non-empty line is "<domain> [asn|ip]" -- the optional second token
+    forces whole-ASN ("asn") or IP-only ("ip") expansion for that domain.
+    """
+    if not path.exists():
+        return []
+    out = []
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        toks = line.split()
+        domain = toks[0]
+        override = None
+        if len(toks) >= 2:
+            override = toks[1].lower()
+            if override not in ("asn", "ip"):
+                print(f"WARNING: invalid override '{toks[1]}' for '{domain}'; ignoring it")
+                override = None
+        out.append((domain, override))
+    return out
+
+
 def resolve_ipv4(host: str) -> list:
     """Resolve a hostname to its IPv4 addresses. Warn and continue on failure."""
     try:
@@ -85,6 +136,51 @@ def resolve_ipv4(host: str) -> list:
         print(f"WARNING: failed to resolve '{host}': {exc}")
         return []
     return sorted({info[4][0] for info in infos})
+
+
+def http_get_json(url: str) -> dict:
+    """GET a JSON URL with the tool User-Agent and a bounded timeout."""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        return json.load(resp)
+
+
+def fetch_cached_json(url: str, cache_path: Path, refresh: bool) -> dict:
+    """Fetch a JSON URL, caching it under build/cache (7-day freshness).
+
+    'refresh' forces a re-download. Prints a one-line cache hit/miss note.
+    """
+    if cache_path.exists() and not refresh and (time.time() - cache_path.stat().st_mtime) < CACHE_AGE_SECONDS:
+        print(f"  cache: hit {cache_path.relative_to(REPO_ROOT)}")
+        return json.loads(cache_path.read_text())
+    data = http_get_json(url)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(data))
+    print(f"  cache: fetched {cache_path.relative_to(REPO_ROOT)}")
+    return data
+
+
+def ensure_ripencc_file(path: Path, refresh: bool) -> bool:
+    """Ensure the RIPE NCC delegated-extended file is on disk and fresh.
+
+    Returns True if a usable file exists (freshly downloaded, cached-still-
+    usable, or stale-but-present after a failed download). Returns False only
+    when there is nothing to read at all.
+    """
+    if path.exists() and not refresh and (time.time() - path.stat().st_mtime) < CACHE_AGE_SECONDS:
+        print(f"cache: hit {path.relative_to(REPO_ROOT)}")
+        return True
+    try:
+        req = urllib.request.Request(RIPENCC_URL, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            data = resp.read()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        print(f"cache: fetched {path.relative_to(REPO_ROOT)} ({len(data)} bytes)")
+        return True
+    except Exception as exc:  # noqa: BLE001 - best-effort, fall back gracefully
+        print(f"WARNING: failed to fetch {RIPENCC_URL}: {exc}")
+        return path.exists()
 
 
 def primary_resolver_nameservers() -> list:
@@ -116,6 +212,60 @@ def primary_resolver_nameservers() -> list:
             if ip:
                 nameservers.append(ip)
     return nameservers
+
+
+def load_ru_asns(path: Path) -> set:
+    """Parse the RIPE NCC delegated file into the set of ASN numbers registered
+    to country RU. Lines are 'ripencc|RU|asn|<start>|<count>|...'; each asn
+    line denotes the ASN range [start, start+count)."""
+    ru = set()
+    try:
+        with path.open() as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line.startswith("ripencc"):
+                    continue
+                parts = line.split("|")
+                if len(parts) < 6 or parts[2] != "asn":
+                    continue
+                # Skip '*' summary lines (e.g. "ripencc|*|asn|*|N|summary").
+                if not (parts[3].lstrip("+").isdigit() and parts[4].lstrip("+").isdigit()):
+                    continue
+                cc, start, count = parts[1], int(parts[3]), int(parts[4])
+                if cc == "RU":
+                    ru.update(range(start, start + count))
+    except Exception as exc:  # noqa: BLE001 - treat as empty on parse failure
+        print(f"WARNING: failed to parse {path}: {exc}")
+        return set()
+    return ru
+
+
+def asn_country(asn_str, ru_asns: set) -> str:
+    """'RU' if the ASN is registered to RU in the RIPE file, else 'other'."""
+    try:
+        return "RU" if int(asn_str) in ru_asns else "other"
+    except ValueError:
+        return "other"
+
+
+def announced_prefixes(asn: str, refresh: bool, cache_dir: Path) -> list:
+    """IPv4 prefixes (list of ipaddress.IPv4Network) announced by an ASN.
+
+    Raises on network failure -- the caller decides how to fall back.
+    """
+    cache_path = cache_dir / f"announced-prefixes-AS{asn}.json"
+    data = fetch_cached_json(
+        ANNOUNCED_PREFIXES_URL.format(asn=asn), cache_path, refresh
+    )
+    nets = []
+    for item in data.get("data", {}).get("prefixes", []):
+        prefix = item.get("prefix")
+        if prefix and ":" not in prefix:  # IPv4 only
+            try:
+                nets.append(ipaddress.ip_network(prefix, strict=False))
+            except ValueError:
+                pass
+    return nets
 
 
 def address_exclude_all(base_networks, exclusions):
@@ -173,6 +323,16 @@ def main() -> int:
         action="store_true",
         help="print what would be generated but do not write build/ files",
     )
+    parser.add_argument(
+        "--no-asn",
+        action="store_true",
+        help="disable whole-ASN expansion of direct domains (old /32-only behaviour)",
+    )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="force re-downloading RIPEstat/RIPE caches instead of reusing them",
+    )
     args = parser.parse_args()
 
     config_dir = Path(args.config).resolve() if args.config else (REPO_ROOT / "local")
@@ -182,8 +342,12 @@ def main() -> int:
 
     print(f"Config dir: {config_dir}")
 
+    cache_dir = REPO_ROOT / "build" / "cache"
+    ripestat_dir = cache_dir / "ripestat"
+    ripencc_path = cache_dir / "delegated-ripencc-extended-latest"
+
     direct_cidrs_raw = read_list(config_dir / "direct-cidrs.txt")
-    direct_domains = read_list(config_dir / "direct-domains.txt")
+    domain_specs = read_direct_domains(config_dir / "direct-domains.txt")
     corp_hosts_check = read_list(config_dir / "corp-hosts-check.txt")
 
     exclusions = set()
@@ -203,11 +367,138 @@ def main() -> int:
         parsed_direct_cidrs.append(net)
         n_direct_cidrs += 1
 
-    resolved_direct = []  # (host, ip)
-    for host in direct_domains:
-        for ip in resolve_ipv4(host):
-            exclusions.add(ipaddress.ip_network(f"{ip}/32"))
-            resolved_direct.append((host, ip))
+    # --- Whole-ASN expansion of direct-domains.txt -------------------------
+    # Load the RIPE NCC country file (cached 7 days) unless expansion is off.
+    ripencc_ok = False
+    ru_asns = set()
+    if not args.no_asn:
+        ripencc_ok = ensure_ripencc_file(ripencc_path, args.refresh)
+        if ripencc_ok:
+            ru_asns = load_ru_asns(ripencc_path)
+
+    resolved_direct = []  # (host, ip), one per resolved address (for checks)
+    domain_records = []   # per-domain reporting records
+    fallback_count = 0    # domains that had to fall back to IP due to network
+
+    for domain, override in domain_specs:
+        ips = resolve_ipv4(domain)
+        ip_nets = [ipaddress.ip_network(f"{ip}/32") for ip in ips]
+        for ip in ips:
+            resolved_direct.append((domain, ip))
+
+        asn_list = []
+        holder = "-"
+        asn_prefix_nets = []  # whole-ASN prefix networks added for this domain
+        mode = "ip"
+        fell_back = False
+
+        if args.no_asn or not ips:
+            mode = "ip"
+        else:
+            first_ip = ips[0]
+            ni = None
+            try:
+                ni = fetch_cached_json(
+                    NETWORK_INFO_URL.format(ip=first_ip),
+                    ripestat_dir / f"network-info-{first_ip}.json",
+                    args.refresh,
+                )
+            except Exception as exc:  # noqa: BLE001 - best-effort, fall back
+                print(f"WARNING: failed to fetch network-info for '{domain}' ({first_ip}): {exc}")
+                if not (ripestat_dir / f"network-info-{first_ip}.json").exists():
+                    fell_back = True
+
+            if ni:
+                data = ni.get("data", {})
+                asn_list = data.get("asns") or []
+                holder = data.get("holder") or "-"
+
+                if override == "asn":
+                    mode = "asn"
+                elif override == "ip":
+                    mode = "ip"
+                else:
+                    # Auto mode: whole-ASN only when safe (RU country, under cap).
+                    if asn_list:
+                        primary = asn_list[0]
+                        country = asn_country(primary, ru_asns)
+                        # Need the primary's prefix count to enforce the cap.
+                        try:
+                            n_primary = len(
+                                announced_prefixes(primary, args.refresh, ripestat_dir)
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            print(f"WARNING: failed to fetch announced-prefixes for AS{primary} ('{domain}'): {exc}")
+                            if not (ripestat_dir / f"announced-prefixes-AS{primary}.json").exists():
+                                fell_back = True
+                            n_primary = ASN_MAX_PREFIXES + 1  # treat as over-cap
+                        if country == "RU" and n_primary <= ASN_MAX_PREFIXES:
+                            mode = "asn"
+                        else:
+                            mode = "ip"
+                    else:
+                        mode = "ip"
+            else:
+                # Could not obtain network-info and no cache -> stay IP-only.
+                mode = "ip"
+                if fell_back:
+                    pass  # already marked
+
+            if mode == "asn":
+                for asn in asn_list:
+                    asn_cc = asn_country(asn, ru_asns)
+                    if override == "asn":
+                        pass  # force whole-ASN, ignore cap/country rule
+                    else:
+                        if asn_cc != "RU":
+                            continue
+                        try:
+                            if len(announced_prefixes(asn, args.refresh, ripestat_dir)) > ASN_MAX_PREFIXES:
+                                continue
+                        except Exception as exc:  # noqa: BLE001
+                            print(f"WARNING: failed to fetch announced-prefixes for AS{asn} ('{domain}'): {exc}")
+                            continue
+                    try:
+                        for net in announced_prefixes(asn, args.refresh, ripestat_dir):
+                            asn_prefix_nets.append(net)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"WARNING: failed to fetch announced-prefixes for AS{asn} ('{domain}'): {exc}")
+                        continue
+                # If we forced 'asn' but nothing could be added, degrade to IP.
+                if not asn_prefix_nets and not (ips):
+                    mode = "ip"
+                elif not asn_prefix_nets:
+                    # No ASN prefixes added (e.g. resolver gave none) -- still
+                    # keep the resolved /32s; that is the useful part.
+                    pass
+
+        if fell_back:
+            fallback_count += 1
+
+        for net in ip_nets:
+            exclusions.add(net)
+        for net in asn_prefix_nets:
+            exclusions.add(net)
+
+        # Reporting record: country taken from the primary ASN.
+        primary = asn_list[0] if asn_list else None
+        if not asn_list:
+            country = "none"
+        elif primary is not None:
+            country = asn_country(primary, ru_asns)
+        else:
+            country = "none"
+        asns_display = ",".join(f"AS{a}" for a in asn_list) if asn_list else "-"
+        domain_records.append({
+            "domain": domain,
+            "ips": ips,
+            "asns": asns_display,
+            "holder": holder,
+            "country": country,
+            "mode": mode,
+            "n_prefixes": len(asn_prefix_nets),
+            "asn_prefixes": asn_prefix_nets,
+        })
 
     resolved_corp_hosts = []  # (host, ip)
     for host in corp_hosts_check:
@@ -225,13 +516,20 @@ def main() -> int:
     total_excluded = sum(net.num_addresses for net in collapsed_exclusions)
     total_covered = sum(net.num_addresses for net in sites)
 
+    n_asn_mode = sum(1 for r in domain_records if r["mode"] == "asn")
+    n_ip_mode = sum(1 for r in domain_records if r["mode"] == "ip")
+
     print()
     print("=== Exclusion summary ===")
     print(f"  special/reserved ranges     : {len(SPECIAL_RANGES)}")
     print(f"  direct-cidrs.txt entries    : {n_direct_cidrs}")
-    print(f"  direct-domains.txt          : {len(direct_domains)} domain(s) -> {len(resolved_direct)} resolved IPv4")
-    for host, ip in resolved_direct:
-        print(f"      {host} -> {ip}")
+    n_total_resolved = sum(len(r["ips"]) for r in domain_records)
+    print(f"  direct-domains.txt          : {len(domain_records)} domain(s) -> {n_total_resolved} resolved IPv4")
+    for r in domain_records:
+        print(f"      {r['domain']} -> {','.join(r['ips']) if r['ips'] else '-'} -> {r['asns']} ({r['holder']}) "
+              f"country={r['country']} mode={r['mode']} prefixes={r['n_prefixes']}")
+    print(f"      modes: {n_asn_mode} domain(s) in asn mode, {n_ip_mode} in ip mode, "
+          f"{fallback_count} fell back to ip due to network")
     print(f"  corp-hosts-check.txt        : {len(corp_hosts_check)} host(s) -> {len(resolved_corp_hosts)} resolved IPv4")
     for host, ip in resolved_corp_hosts:
         print(f"      {host} -> {ip}")
@@ -306,6 +604,15 @@ def main() -> int:
                   not covered_by(ip, sites))
     else:
         print("  [SKIP] no direct-domains.txt hosts resolved")
+
+    # Every whole-ASN prefix added for a direct domain must be excluded too:
+    # test one representative address (the prefix's network address) of every
+    # added ASN prefix -- linear, not every address.
+    for r in domain_records:
+        for net in r["asn_prefixes"]:
+            rep = str(net.network_address)
+            check(f"direct-domains.txt {r['domain']} ASN prefix {net} ({rep}) is NOT covered",
+                  not covered_by(rep, sites))
 
     # corp-hosts-check.txt may resolve to public (non-RFC1918, non-direct-cidr)
     # IPs -- e.g. a corporate host hosted outside the corporate network's own

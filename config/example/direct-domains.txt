@@ -1,5 +1,13 @@
 # Domains that must bypass the personal VPN entirely (e.g. services that
 # geo-block or otherwise misbehave when seen from a foreign exit IP).
-# Resolved at generation time; their IPv4 addresses are excluded from the
-# Amnezia site list. One domain per line.
+# Resolved at generation time; their IPv4 addresses -- and, when safe, the
+# whole owning autonomous system -- are excluded from the Amnezia site list.
+#
+# Optional second token: "<domain> asn" forces whole-ASN expansion even if
+# the ASN is big / not RU-registered; "<domain> ip" forces IP-only (/32)
+# expansion. See gen-amnezia-sites.py for the default, safety-gated mode.
+#
+# A ready-made list of popular Russian services lives in
+# config/presets/direct-domains.ru-popular.txt -- copy it to
+# local/direct-domains.txt and edit there rather than filling this template.
 gov.example

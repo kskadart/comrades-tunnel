@@ -1,0 +1,66 @@
+# Popular Russian services whose IPv4 addresses must bypass the personal VPN
+# entirely (they geo-block or misbehave when seen from a foreign exit IP).
+# Copied to local/direct-domains.txt at setup time; edit there as needed.
+#
+# Each line is one domain. There is an optional second token after the domain
+# that controls how aggressively that domain is excluded:
+#
+#     <domain>          whole-ASN expansion when safe (default)
+#     <domain> asn      force expansion to the whole owning autonomous system,
+#                       even if the ASN is big / not RU-registered
+#     <domain> ip       only the resolved IP addresses (/32s), no ASN expansion
+#
+# "Whole-ASN expansion" means: the domain is resolved, its first IPv4 address
+# is looked up in RIPEstat to find the owning ASN, and -- when that ASN is
+# registered to country RU and announces a bounded number of IPv4 prefixes --
+# the entire ASN's prefixes are excluded from the personal VPN, not just the
+# handful of /32s the domain happens to resolve to. This keeps CDN /
+# load-balancer ranges covered as their member addresses change.
+#
+# Domains are grouped by sector.
+
+# Government
+gosuslugi.ru
+nalog.gov.ru
+mos.ru
+
+# Banks
+sberbank.ru
+tbank.ru
+tinkoff.ru
+vtb.ru
+
+# Yandex
+yandex.ru
+ya.ru
+dzen.ru
+kinopoisk.ru
+
+# VK / Mail.ru
+vk.com
+mail.ru
+ok.ru
+
+# Marketplaces
+ozon.ru
+wildberries.ru
+avito.ru
+
+# Telecom
+mts.ru
+beeline.ru
+megafon.ru
+rt.ru
+
+# Logistics / transport
+pochta.ru
+cdek.ru
+rzd.ru
+aeroflot.ru
+
+# Media / maps
+rutube.ru
+2gis.ru
+
+# Jobs
+hh.ru
