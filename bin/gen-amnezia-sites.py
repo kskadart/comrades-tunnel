@@ -271,12 +271,17 @@ def main() -> int:
     for ip in ("10.0.0.1", "172.16.0.1", "192.168.1.1", "203.0.113.10", "203.0.113.20"):
         check(f"{ip} is NOT covered by the site list", not covered_by(ip, sites))
 
-    corphost_ips = [ip for host, ip in resolved_corp_hosts if host == "corp-host.example"]
-    if corphost_ips:
-        for ip in corphost_ips:
-            check(f"corp-host.example ({ip}) is NOT covered by the site list", not covered_by(ip, sites))
+    # corp-hosts-check.txt may resolve to public (non-RFC1918, non-direct-cidr)
+    # IPs -- e.g. a corporate host hosted outside the corporate network's own
+    # netblocks. Those are excluded from the site list only via this
+    # host-resolution step, not via any CIDR range, so verifying each one is
+    # a meaningful check of that exclusion path (config-driven, no hostname
+    # hardcoded here -- see resolved_corp_hosts, built from corp-hosts-check.txt).
+    if resolved_corp_hosts:
+        for host, ip in resolved_corp_hosts:
+            check(f"corp-hosts-check.txt host {host} ({ip}) is NOT covered by the site list", not covered_by(ip, sites))
     else:
-        print("  [SKIP] corp-host.example not in corp-hosts-check.txt or failed to resolve")
+        print("  [SKIP] no corp-hosts-check.txt hosts resolved")
 
     disjoint = True
     for site in sites:
