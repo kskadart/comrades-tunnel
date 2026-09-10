@@ -44,6 +44,7 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 CONFIG_DIR=""
 CONF_FILE="$SCRIPT_DIR/dns-guard.conf"
 DRY_RUN=0
+PRINT_SERVICE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -59,12 +60,39 @@ while [ $# -gt 0 ]; do
             DRY_RUN=1
             shift
             ;;
+        --print-service)
+            PRINT_SERVICE=1
+            shift
+            ;;
         *)
-            echo "Usage: $0 [--config DIR] [--dry-run]" >&2
+            echo "Usage: $0 [--config DIR] [--dry-run] [--print-service]" >&2
             exit 2
             ;;
     esac
 done
+
+# Standalone mode: print the detected primary service name (the one DNS guard
+# would act on) and exit 0. This duplicates the interface -> service awk
+# mapping from service_for_interface() below, because this early-exit path
+# runs before that helper is defined; keep both copies in sync if the mapping
+# ever changes. Exits 2 if no default interface/service can be found.
+if [ "$PRINT_SERVICE" = 1 ]; then
+    iface=$(route -n get default 2>/dev/null | sed -n 's/^[[:space:]]*interface: *//p' | head -1)
+    if [ -z "$iface" ]; then
+        echo "dns-guard: no default interface found" >&2
+        exit 2
+    fi
+    service=$(networksetup -listnetworkserviceorder | awk -v want="Device: $iface)" '
+        /^\([0-9]+\)/ { name = $0; sub(/^\([0-9]+\)[ \t]*/, "", name) }
+        index($0, want) { print name; exit }
+    ')
+    if [ -z "$service" ]; then
+        echo "dns-guard: no network service found for interface $iface" >&2
+        exit 2
+    fi
+    printf '%s\n' "$service"
+    exit 0
+fi
 
 LOG_FILE="/var/log/comrades-tunnel-dns-guard.log"
 
