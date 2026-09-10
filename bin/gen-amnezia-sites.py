@@ -119,27 +119,41 @@ def primary_resolver_nameservers() -> list:
 
 
 def address_exclude_all(base_networks, exclusions):
-    """Complement of `base_networks` minus `exclusions`, using
-    ipaddress.collapse_addresses() to merge exclusions and
-    IPv4Network.address_exclude() to carve each one out."""
-    remaining = list(base_networks)
+    """Complement of the full IPv4 space minus `exclusions`, computed linearly
+    over the gaps between consecutive collapsed exclusions.
+
+    Exclusions are merged with ipaddress.collapse_addresses() and sorted by
+    start address; then, walking from 0 to 2^32-1, every gap between one
+    exclusion and the next is emitted via ipaddress.summarize_address_range().
+    This is linear in the number of collapsed exclusions, so it scales to
+    exclusion sets of tens of thousands of networks (e.g. a country's IP
+    ranges) -- unlike repeated IPv4Network.address_exclude() calls, which are
+    quadratic. `base_networks` is accepted for caller compatibility but the
+    complement always spans the whole 0.0.0.0/0 space."""
     collapsed = sorted(
         ipaddress.collapse_addresses(exclusions),
         key=lambda n: (int(n.network_address), n.prefixlen),
     )
-    for excl in collapsed:
-        next_remaining = []
-        for net in remaining:
-            if net == excl:
-                continue  # net fully excluded
-            if excl.subnet_of(net):
-                next_remaining.extend(net.address_exclude(excl))
-            elif net.subnet_of(excl):
-                continue  # net fully excluded (shouldn't happen for disjoint excl set)
-            else:
-                next_remaining.append(net)
-        remaining = next_remaining
-    return remaining, collapsed
+    sites = []
+    cursor = 0  # integer start of the not-yet-covered span
+    for net in collapsed:
+        start = int(net.network_address)
+        if start > cursor:
+            sites.extend(
+                ipaddress.summarize_address_range(
+                    ipaddress.IPv4Address(cursor),
+                    ipaddress.IPv4Address(start - 1),
+                )
+            )
+        cursor = int(net.broadcast_address) + 1
+    if cursor <= MAX_ADDR - 1:
+        sites.extend(
+            ipaddress.summarize_address_range(
+                ipaddress.IPv4Address(cursor),
+                ipaddress.IPv4Address(MAX_ADDR - 1),
+            )
+        )
+    return sites, collapsed
 
 
 def covered_by(ip_str: str, networks) -> bool:
@@ -178,6 +192,7 @@ def main() -> int:
         exclusions.add(ipaddress.ip_network(cidr))
 
     n_direct_cidrs = 0
+    parsed_direct_cidrs = []  # valid CIDR networks parsed from direct-cidrs.txt
     for cidr in direct_cidrs_raw:
         try:
             net = ipaddress.ip_network(cidr, strict=False)
@@ -185,6 +200,7 @@ def main() -> int:
             print(f"WARNING: skipping invalid CIDR '{cidr}' in direct-cidrs.txt: {exc}")
             continue
         exclusions.add(net)
+        parsed_direct_cidrs.append(net)
         n_direct_cidrs += 1
 
     resolved_direct = []  # (host, ip)
@@ -268,8 +284,28 @@ def main() -> int:
     check("8.8.8.8 is covered by the site list", covered_by("8.8.8.8", sites))
     check("1.1.1.1 is covered by the site list", covered_by("1.1.1.1", sites))
 
-    for ip in ("10.0.0.1", "172.16.0.1", "192.168.1.1", "203.0.113.10", "203.0.113.20"):
+    # Representative private (RFC 1918) addresses must NOT be covered -- they
+    # are excluded via the special-purpose ranges above.
+    for ip in ("10.0.0.1", "172.16.0.1", "192.168.1.1"):
         check(f"{ip} is NOT covered by the site list", not covered_by(ip, sites))
+
+    # First address of every direct-cidrs.txt entry must NOT be covered (the
+    # entire entry is excluded, so even its first host must stay off the site
+    # list). Config-driven -- no machine-specific IP hardcoded here.
+    for net in parsed_direct_cidrs:
+        first = net.network_address
+        check(f"direct-cidrs.txt first address {first} is NOT covered by the site list",
+              not covered_by(str(first), sites))
+
+    # Every resolved direct-domains.txt IP must NOT be covered. Unresolvable
+    # placeholder domains (e.g. in config/example) only produce WARNINGs above,
+    # so this check is skipped when nothing resolved.
+    if resolved_direct:
+        for host, ip in resolved_direct:
+            check(f"direct-domains.txt host {host} ({ip}) is NOT covered by the site list",
+                  not covered_by(ip, sites))
+    else:
+        print("  [SKIP] no direct-domains.txt hosts resolved")
 
     # corp-hosts-check.txt may resolve to public (non-RFC1918, non-direct-cidr)
     # IPs -- e.g. a corporate host hosted outside the corporate network's own
@@ -279,16 +315,35 @@ def main() -> int:
     # hardcoded here -- see resolved_corp_hosts, built from corp-hosts-check.txt).
     if resolved_corp_hosts:
         for host, ip in resolved_corp_hosts:
-            check(f"corp-hosts-check.txt host {host} ({ip}) is NOT covered by the site list", not covered_by(ip, sites))
+            check(f"corp-hosts-check.txt host {host} ({ip}) is NOT covered by the site list",
+                  not covered_by(ip, sites))
     else:
         print("  [SKIP] no corp-hosts-check.txt hosts resolved")
 
+    # Every primary-resolver nameserver must NOT be covered, so DNS traffic
+    # itself never enters the personal VPN tunnel.
+    for ip in resolver_ns:
+        check(f"primary resolver nameserver {ip} is NOT covered by the site list",
+              not covered_by(ip, sites))
+
+    # Linear disjointness sweep: sites and collapsed exclusions merged into one
+    # list sorted by start address; each network must begin after the previous
+    # one ends. Linear in the combined size -- no site-vs-exclusion pairwise
+    # loop (which would be quadratic with tens of thousands of exclusions).
     disjoint = True
-    for site in sites:
-        for excl in collapsed_exclusions:
-            if site.overlaps(excl):
-                disjoint = False
-                print(f"      overlap: site {site} overlaps exclusion {excl}")
+    merged = sorted(
+        sites + collapsed_exclusions,
+        key=lambda n: (int(n.network_address), n.prefixlen),
+    )
+    prev_end = None
+    for net in merged:
+        start = int(net.network_address)
+        if prev_end is not None and start <= prev_end:
+            disjoint = False
+            print(f"      overlap: network {net} starts at {start}, "
+                  f"previous ends at {prev_end + 1}")
+            break
+        prev_end = int(net.broadcast_address)
     check("site list is disjoint from every exclusion", disjoint)
 
     check("covered + excluded addresses == 2^32", total_covered + total_excluded == MAX_ADDR)

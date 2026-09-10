@@ -46,6 +46,7 @@ done
 
 DOMAINS_FILE="$CONFIG_DIR/corp-domains.txt"
 DNS_FILE="$CONFIG_DIR/corp-dns.txt"
+OPTIONS_FILE="$CONFIG_DIR/corp-dns-options.txt"
 
 if [ ! -f "$DOMAINS_FILE" ]; then
     echo "ERROR: $DOMAINS_FILE not found" >&2
@@ -93,6 +94,11 @@ for domain in $DOMAINS; do
     for ip in $DNS_IPS; do
         echo "nameserver $ip" >> "$TMP_RENDERED"
     done
+    # Optional resolver(5) options (e.g. "timeout 3", "search_order 1"), each
+    # non-comment, non-blank line appended verbatim after the nameservers.
+    if [ -f "$OPTIONS_FILE" ]; then
+        read_lines "$OPTIONS_FILE" >> "$TMP_RENDERED"
+    fi
 
     echo "=== $TARGET ==="
     echo "--- rendered content ---"

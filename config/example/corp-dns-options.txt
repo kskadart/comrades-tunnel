@@ -1,0 +1,5 @@
+# Optional macOS resolver(5) options appended verbatim (one per line) after
+# the "nameserver" lines of every /etc/resolver/<domain> file rendered by
+# bin/install-resolvers.sh. Uncomment/replace the example below as needed;
+# leave this file empty (or omit it entirely) for no extra options.
+timeout 3

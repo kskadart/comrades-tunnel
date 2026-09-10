@@ -63,33 +63,45 @@ detect_utun_by_prefix() {
     return 1
 }
 
-CP_UTUN=$(detect_utun_by_prefix "10.0.42.")
-AMNEZIA_UTUN=$(detect_utun_by_prefix "10.8.")
+# Tunnel interface prefixes are machine-specific, so they live in the config
+# dir as tunnels.txt (KEY=VALUE lines, parsed with grep/cut -- never sourced).
+TUNNELS_FILE="$CONFIG_DIR/tunnels.txt"
+
+get_tunnel_prefix() {
+    # get_tunnel_prefix KEY -- return the VALUE of "KEY=" in tunnels.txt
+    key=$1
+    grep "^${key}=" "$TUNNELS_FILE" 2>/dev/null | head -1 | cut -d= -f2-
+}
+
+CORP_TUNNEL_PREFIX=$(get_tunnel_prefix CORP_TUNNEL_PREFIX)     # inet prefix of the corporate VPN utun
+PERSONAL_TUNNEL_PREFIX=$(get_tunnel_prefix PERSONAL_TUNNEL_PREFIX)  # inet prefix of the personal (Amnezia) utun
+
+CP_UTUN=$(detect_utun_by_prefix "$CORP_TUNNEL_PREFIX")
+AMNEZIA_UTUN=$(detect_utun_by_prefix "$PERSONAL_TUNNEL_PREFIX")
 
 echo "Config dir: $CONFIG_DIR"
-echo "Detected Check Point utun (inet 10.0.42.x): ${CP_UTUN:-<not found>}"
-echo "Detected Amnezia utun (inet 10.8.x):        ${AMNEZIA_UTUN:-<not found>}"
+echo "Corporate utun prefix (inet ${CORP_TUNNEL_PREFIX:-<unset>}): ${CP_UTUN:-<not found>}"
+echo "Personal (Amnezia) utun prefix (inet ${PERSONAL_TUNNEL_PREFIX:-<unset>}): ${AMNEZIA_UTUN:-<not found>}"
 echo
 
 route_iface() {
     route -n get "$1" 2>/dev/null | awk '/interface:/{print $2}'
 }
 
-is_rfc1918_or_corp_public() {
+is_rfc1918() {
+    # RFC 1918 private ranges (10/8, 172.16/12, 192.168/16).
     case "$1" in
         10.*) return 0 ;;
         172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
         192.168.*) return 0 ;;
-        203.0.113.*) return 0 ;;
         *) return 1 ;;
     esac
 }
 
 # Known VPN gateway host-routes: any /32 entry in direct-cidrs.txt. These
-# must always reach the internet via en0 (the physical interface), even
-# though their address may otherwise look like it belongs to the Check
-# Point-pushed 203.0.113.x range -- a VPN client cannot tunnel packets to its
-# own gateway through the tunnel it's building.
+# must always reach the internet via en0 (the physical interface) -- a VPN
+# client cannot tunnel packets to its own gateway through the tunnel it's
+# building, even if the gateway's address lies inside a corporate netblock.
 GATEWAY_IPS=$(read_lines "$CONFIG_DIR/direct-cidrs.txt" | grep '/32$' | sed 's#/32$##')
 
 is_gateway_ip() {
@@ -120,16 +132,30 @@ for host in $HOSTS; do
 
     iface=$(route_iface "$test_ip")
 
+    # Expected route interface for this host, generalized (no corporate
+    # netblocks hardcoded here):
+    #   - resolved IP is a /32 in direct-cidrs.txt  -> en0 (VPN gateway)
+    #   - otherwise the IP is RFC 1918               -> corporate VPN utun
+    #   - otherwise (public corporate host)          -> NOT the personal utun
     if is_gateway_ip "$test_ip"; then
         expected="en0"
-    elif is_rfc1918_or_corp_public "$test_ip"; then
+    elif is_rfc1918 "$test_ip"; then
         expected="${CP_UTUN:-CP_utun}"
     else
-        expected="en0"
+        expected="!${AMNEZIA_UTUN:-Amnezia_utun}"
     fi
 
     result_status=1
-    [ "$iface" = "$expected" ] && result_status=0
+    case "$expected" in
+        '!'*)
+            # "NOT the personal utun" expectation: PASS if a different interface
+            personal=${expected#!}
+            [ "$iface" != "$personal" ] && result_status=0
+            ;;
+        *)
+            [ "$iface" = "$expected" ] && result_status=0
+            ;;
+    esac
 
     printf '  %-52s %-16s %-16s %-10s %-10s ' "$host" "${dscache_ip:--}" "${dig_ip:--}" "${iface:--}" "$expected"
     if [ "$result_status" = 0 ]; then

@@ -1,0 +1,11 @@
+# Machine-specific inet prefixes of the two VPN tunnel interfaces, used by
+# bin/check-split.sh to detect which utun is which.
+#
+# Find yours with:  ifconfig | grep -A3 utun
+# Each utun<number> block shows one "inet <addr>" line; one of the two VPN
+# utuns belongs to the corporate VPN and the other to the personal (Amnezia)
+# VPN. Set each prefix to that interface's inet prefix, including the final
+# dot. Replace the placeholder values below with your real ones; keep both
+# lines exactly in KEY=VALUE form.
+CORP_TUNNEL_PREFIX=REPLACE_WITH_CORP_UTUN_PREFIX
+PERSONAL_TUNNEL_PREFIX=REPLACE_WITH_PERSONAL_UTUN_PREFIX
