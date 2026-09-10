@@ -1,0 +1,19 @@
+# Settings for bin/dns-guard.sh (see install-dns-guard.sh for how this is
+# rendered into the installed dns-guard.conf).
+#
+# SERVERS: space-separated DNS servers to enforce on the primary network
+# service, e.g. the personal VPN's own resolvers. These are placeholders --
+# use whatever your personal VPN/DNS provider expects.
+SERVERS=1.1.1.1 1.0.0.1
+
+# MODE: "corp-only" only reverts the DNS list when it currently contains one
+# of the corporate DNS servers listed in corp-dns.txt (i.e. right after the
+# corporate VPN client rewrites it) -- it leaves the DNS list alone the rest
+# of the time, even if something else set it to a third value. "always"
+# enforces SERVERS whenever the current list differs from it, regardless of
+# what changed it.
+MODE=corp-only
+
+# CORP_DNS is not set here: dns-guard.sh derives it from corp-dns.txt
+# (the same file install-resolvers.sh reads) when run with --config DIR,
+# or from the installed dns-guard.conf's own CORP_DNS= line otherwise.

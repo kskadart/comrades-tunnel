@@ -45,6 +45,63 @@ DNS устроен отдельно от маршрутизации трафик
 только через корпоративный туннель; запрос к любому другому имени идёт через
 обычный системный резолвер как обычно.
 
+## DNS: клиент Check Point переписывает DNS Wi-Fi
+
+При подключении корпоративный клиент Check Point Endpoint Security VPN сам
+переписывает DNS-серверы основного сетевого сервиса (Wi-Fi) на слое Setup —
+том же слое, что System Settings и `networksetup -setdnsservers`: он
+дописывает в начало списка корпоративные DNS-серверы и свои search domains,
+оставляя DHCP-серверы позади них.
+Что бы ни стояло там раньше (например, DNS личного VPN), оно теряется.
+
+Следствие: пока корпоративный DNS стоит первым в списке, часть публичных
+имён не резолвится — например, видеохостинги фильтруются корпоративной DNS.
+Ручная правка (`networksetup -setdnsservers Wi-Fi ...`) не помогает: клиент
+переписывает тот же слой при каждом переподключении, так что изменение живёт
+только до следующего reconnect.
+
+Split-DNS для корпоративных зон через `/etc/resolver/<zone>` (см. выше)
+работает независимо от системного списка DNS-серверов, поэтому убрать
+корпоративные серверы из этого списка ничего не ломает.
+
+`bin/dns-guard.sh`, установленный `bin/install-dns-guard.sh` как
+LaunchDaemon, следит за
+`/Library/Preferences/SystemConfiguration/preferences.plist` и
+`/private/var/run/resolv.conf` (плюс запуск при загрузке) и восстанавливает
+желаемый список DNS-серверов, не трогая search domains. Два режима:
+`corp-only` (по умолчанию) — вмешивается только когда в текущем списке
+обнаружен один из корпоративных DNS-серверов; `always` — приводит список к
+заданным серверам при любом расхождении.
+
+Установка (сначала dry-run, затем применить):
+
+```
+sh bin/install-dns-guard.sh
+sudo sh bin/install-dns-guard.sh --apply
+```
+
+Удаление:
+
+```
+sudo sh bin/install-dns-guard.sh --uninstall
+```
+
+`--apply` и `--uninstall` требуют `sudo`: скрипт и конфиг копируются в
+`/usr/local/lib/comrades-tunnel/` от root, LaunchDaemon ставится в
+`/Library/LaunchDaemons/`. Копия root-owned намеренно: демон исполняет её от
+root при каждом срабатывании, и если бы вместо этого он запускал файл прямо
+из домашней директории пользователя, это была бы дыра для повышения
+привилегий — что угодно, способное писать в эту директорию, могло бы
+подменить код, который затем выполнится от root.
+
+Логи: `/var/log/comrades-tunnel-dns-guard.log`. Проверка после
+переподключения корпоративного VPN:
+
+```
+networksetup -getdnsservers Wi-Fi
+tail /var/log/comrades-tunnel-dns-guard.log
+```
+
 ## Что никогда не попадает в личный VPN
 
 Список исключений, из которого генератор (`bin/gen-amnezia-sites.py`) строит
@@ -126,6 +183,10 @@ WireGuard/AmneziaWG, `python3`, `git`.
    - `local/tunnels.txt` — префиксы `inet`-адресов двух VPN-туннелей.
      Найти их: `ifconfig | grep -A3 utun` — один из блоков `utunN` будет
      принадлежать корпоративному VPN, другой — личному (Amnezia).
+   - `local/dns-guard.txt` — настройки `bin/dns-guard.sh`: желаемые
+     DNS-серверы (`SERVERS`) и режим (`MODE`, см. раздел про DNS выше);
+     корпоративные DNS-серверы берутся из уже заполненного
+     `local/corp-dns.txt`.
 
 2. Сгенерируйте список сайтов:
 
@@ -207,6 +268,8 @@ WireGuard/AmneziaWG, `python3`, `git`.
 bin/
   gen-amnezia-sites.py   генератор списка сайтов для AmneziaVPN
   install-resolvers.sh   установка /etc/resolver/<zone> для split-DNS
+  dns-guard.sh           восстановление DNS Wi-Fi после Check Point
+  install-dns-guard.sh   установка dns-guard.sh как LaunchDaemon
   check-split.sh         проверка фактического разбиения маршрутов
 config/
   example/               шаблон конфигурации (плейсхолдеры, безопасно коммитить)

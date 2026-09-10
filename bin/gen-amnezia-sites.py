@@ -47,6 +47,7 @@ import argparse
 import ipaddress
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -229,24 +230,53 @@ def default_interface() -> str:
 def dhcp_nameservers() -> list:
     """Nameservers handed out by DHCP on the primary interface.
 
-    The primary interface is `default_interface()`; its DHCP nameservers come
-    from `ipconfig getoption <iface> domain_name_server` (one IP per line,
-    empty when DHCP offered none). Best-effort: any failure or empty result
-    returns [] with an INFO line -- never fatal.
+    The primary interface is `default_interface()`. `ipconfig getoption
+    <iface> domain_name_server` only ever prints the first DHCP nameserver,
+    even when the DHCP lease offered several -- so nameservers are parsed
+    from `ipconfig getpacket <iface>` instead, which prints the full option
+    as a `domain_name_server (ip_mult): {a, b, c}` line. `getoption` is used
+    only as a fallback when `getpacket` yields nothing (e.g. no active
+    lease). Best-effort: any failure or empty result returns [] with an
+    INFO line -- never fatal.
     """
     iface = default_interface()
     if not iface:
         print("INFO: unknown primary interface; no DHCP nameservers")
         return []
+
+    nameservers = []
     try:
         proc = subprocess.run(
-            ["ipconfig", "getoption", iface, "domain_name_server"],
+            ["ipconfig", "getpacket", iface],
             capture_output=True, text=True, check=True,
         )
     except Exception as exc:  # noqa: BLE001 - best-effort, never fatal
-        print(f"INFO: failed to run 'ipconfig getoption {iface} domain_name_server': {exc}")
-        return []
-    nameservers = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        print(f"INFO: failed to run 'ipconfig getpacket {iface}': {exc}")
+        proc = None
+    if proc is not None:
+        for line in proc.stdout.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("domain_name_server"):
+                continue
+            match = re.search(r"\{([^}]*)\}", stripped)
+            if not match:
+                continue
+            nameservers = [
+                ip.strip() for ip in match.group(1).split(",") if ip.strip()
+            ]
+            break
+
+    if not nameservers:
+        try:
+            proc = subprocess.run(
+                ["ipconfig", "getoption", iface, "domain_name_server"],
+                capture_output=True, text=True, check=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort, never fatal
+            print(f"INFO: failed to run 'ipconfig getoption {iface} domain_name_server': {exc}")
+            return []
+        nameservers = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
     if not nameservers:
         print(f"INFO: DHCP offers no nameservers on interface {iface}")
         return []
