@@ -405,8 +405,10 @@ def main() -> int:
                 )
             except Exception as exc:  # noqa: BLE001 - best-effort, fall back
                 print(f"WARNING: failed to fetch network-info for '{domain}' ({first_ip}): {exc}")
-                if not (ripestat_dir / f"network-info-{first_ip}.json").exists():
-                    fell_back = True
+                # This failure always leaves mode == "ip" below (ni stays None),
+                # regardless of whether a stale cache file happens to still be
+                # on disk -- it is never read as a substitute here, so count it.
+                fell_back = True
 
             if ni:
                 data = ni.get("data", {})
@@ -429,8 +431,11 @@ def main() -> int:
                             )
                         except Exception as exc:  # noqa: BLE001
                             print(f"WARNING: failed to fetch announced-prefixes for AS{primary} ('{domain}'): {exc}")
-                            if not (ripestat_dir / f"announced-prefixes-AS{primary}.json").exists():
-                                fell_back = True
+                            # This failure always forces mode == "ip" below (cap
+                            # treated as exceeded), regardless of a stale cache
+                            # file on disk -- it is never read as a substitute
+                            # here, so count it.
+                            fell_back = True
                             n_primary = ASN_MAX_PREFIXES + 1  # treat as over-cap
                         if country == "RU" and n_primary <= ASN_MAX_PREFIXES:
                             mode = "asn"
