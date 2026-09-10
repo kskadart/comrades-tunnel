@@ -1,0 +1,6 @@
+# Extra DNS servers that must ALWAYS be reached directly, in addition to the
+# ones handed out by DHCP on the primary interface (which are excluded
+# automatically). Useful for e.g. an office resolver on a wired network you
+# use sometimes and whose DNS is not offered by DHCP.
+# One IP address per line; '#' starts a comment.
+# 203.0.113.53

@@ -11,8 +11,10 @@ personal VPN:
   - resolved IPv4 addresses of direct-domains.txt (geo-blocking-sensitive
     Russian services that must be reached directly)
   - resolved IPv4 addresses of corp-hosts-check.txt (known corporate hosts)
-  - the nameservers of the primary system DNS resolver (resolver #1 in
-    `scutil --dns`), so DNS itself never goes through the tunnel
+  - DNS servers handed out by DHCP on the primary interface (`ipconfig
+    getoption <iface> domain_name_server`), so DNS traffic never goes through
+    the tunnel -- plus any extra IPs from direct-dns.txt
+    (e.g. an office resolver on a network where DHCP does not offer it)
 
 By default each direct-domains.txt entry is *expanded* to the whole
 autonomous system (AS) that owns it when that is safe: the domain is
@@ -207,34 +209,47 @@ def ensure_ripencc_file(path: Path, refresh: bool) -> bool:
         return path.exists()
 
 
-def primary_resolver_nameservers() -> list:
-    """Nameservers of resolver #1 from `scutil --dns` (the primary system resolver)."""
+def default_interface() -> str:
+    """Name of the primary interface (the default route's interface)."""
     try:
         proc = subprocess.run(
-            ["scutil", "--dns"], capture_output=True, text=True, check=True
+            ["route", "-n", "get", "default"], capture_output=True, text=True, check=True
         )
     except Exception as exc:  # noqa: BLE001 - best-effort, never fatal
-        print(f"WARNING: failed to run 'scutil --dns': {exc}")
-        return []
-
-    # `scutil --dns` prints a "DNS configuration" section followed by a
-    # separate "DNS configuration (for scoped queries)" section, each with
-    # its own "resolver #1" -- stop after the first resolver #1 block so
-    # scoped-query duplicates of the same nameservers aren't double counted.
-    nameservers = []
-    in_resolver_1 = False
+        print(f"INFO: failed to run 'route -n get default': {exc}; no primary interface")
+        return ""
     for line in proc.stdout.splitlines():
         stripped = line.strip()
-        if stripped.startswith("resolver #") or stripped.startswith("DNS configuration"):
-            if in_resolver_1:
-                break  # end of the first resolver #1 block
-            in_resolver_1 = stripped == "resolver #1"
-            continue
-        if in_resolver_1 and stripped.startswith("nameserver["):
-            _, _, value = stripped.partition(":")
-            ip = value.strip()
-            if ip:
-                nameservers.append(ip)
+        if stripped.startswith("interface:"):
+            return stripped.partition(":")[2].strip()
+    print("INFO: no interface found in 'route -n get default' output")
+    return ""
+
+
+def dhcp_nameservers() -> list:
+    """Nameservers handed out by DHCP on the primary interface.
+
+    The primary interface is `default_interface()`; its DHCP nameservers come
+    from `ipconfig getoption <iface> domain_name_server` (one IP per line,
+    empty when DHCP offered none). Best-effort: any failure or empty result
+    returns [] with an INFO line -- never fatal.
+    """
+    iface = default_interface()
+    if not iface:
+        print("INFO: unknown primary interface; no DHCP nameservers")
+        return []
+    try:
+        proc = subprocess.run(
+            ["ipconfig", "getoption", iface, "domain_name_server"],
+            capture_output=True, text=True, check=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort, never fatal
+        print(f"INFO: failed to run 'ipconfig getoption {iface} domain_name_server': {exc}")
+        return []
+    nameservers = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    if not nameservers:
+        print(f"INFO: DHCP offers no nameservers on interface {iface}")
+        return []
     return nameservers
 
 
@@ -565,8 +580,11 @@ def main() -> int:
             exclusions.add(ipaddress.ip_network(f"{ip}/32"))
             resolved_corp_hosts.append((host, ip))
 
-    resolver_ns = primary_resolver_nameservers()
-    for ip in resolver_ns:
+    dhcp_ns = dhcp_nameservers()
+    for ip in dhcp_ns:
+        exclusions.add(ipaddress.ip_network(f"{ip}/32"))
+    direct_dns = read_list(config_dir / "direct-dns.txt")
+    for ip in direct_dns:
         exclusions.add(ipaddress.ip_network(f"{ip}/32"))
 
     sites, collapsed_exclusions = address_exclude_all([FULL_IPV4], exclusions)
@@ -592,7 +610,8 @@ def main() -> int:
     print(f"  corp-hosts-check.txt        : {len(corp_hosts_check)} host(s) -> {len(resolved_corp_hosts)} resolved IPv4")
     for host, ip in resolved_corp_hosts:
         print(f"      {host} -> {ip}")
-    print(f"  primary resolver nameservers: {len(resolver_ns)} -> {resolver_ns}")
+    print(f"  DHCP nameservers ({default_interface()}): {len(dhcp_ns)} -> {dhcp_ns}")
+    print(f"  direct-dns.txt                : {len(direct_dns)} -> {direct_dns}")
     print(f"  collapsed exclusion networks: {len(collapsed_exclusions)}")
     print(f"  total excluded addresses    : {total_excluded}")
     print()
@@ -686,10 +705,13 @@ def main() -> int:
     else:
         print("  [SKIP] no corp-hosts-check.txt hosts resolved")
 
-    # Every primary-resolver nameserver must NOT be covered, so DNS traffic
-    # itself never enters the personal VPN tunnel.
-    for ip in resolver_ns:
-        check(f"primary resolver nameserver {ip} is NOT covered by the site list",
+    # Every DHCP nameserver and every direct-dns.txt IP must NOT be covered,
+    # so DNS traffic itself never enters the personal VPN tunnel.
+    for ip in dhcp_ns:
+        check(f"DHCP nameserver {ip} is NOT covered by the site list",
+              not covered_by(ip, sites))
+    for ip in direct_dns:
+        check(f"direct-dns.txt {ip} is NOT covered by the site list",
               not covered_by(ip, sites))
 
     # Linear disjointness sweep: sites and collapsed exclusions merged into one
