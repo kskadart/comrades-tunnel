@@ -44,6 +44,7 @@ direct-domains.txt syntax (optional second token after the domain):
 import argparse
 import ipaddress
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -89,6 +90,21 @@ USER_AGENT = "comrades-tunnel/1.0"
 RIPENCC_URL = "https://ftp.ripe.net/pub/stats/ripencc/delegated-ripencc-extended-latest"
 NETWORK_INFO_URL = "https://stat.ripe.net/data/network-info/data.json?resource={ip}&sourceapp=comrades-tunnel"
 ANNOUNCED_PREFIXES_URL = "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS{asn}&sourceapp=comrades-tunnel"
+AS_OVERVIEW_URL = "https://stat.ripe.net/data/as-overview/data.json?resource=AS{asn}&sourceapp=comrades-tunnel"
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write text to `path` atomically: write to '<path>.tmp' then rename."""
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write bytes to `path` atomically: write to '<path>.tmp' then rename."""
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
 
 
 def read_list(path: Path) -> list:
@@ -149,13 +165,21 @@ def fetch_cached_json(url: str, cache_path: Path, refresh: bool) -> dict:
     """Fetch a JSON URL, caching it under build/cache (7-day freshness).
 
     'refresh' forces a re-download. Prints a one-line cache hit/miss note.
+    A cache file that fails to parse as JSON is deleted and re-fetched once;
+    if that re-fetch also fails, the exception propagates to the caller,
+    which already warns and falls back.
     """
     if cache_path.exists() and not refresh and (time.time() - cache_path.stat().st_mtime) < CACHE_AGE_SECONDS:
-        print(f"  cache: hit {cache_path.relative_to(REPO_ROOT)}")
-        return json.loads(cache_path.read_text())
+        try:
+            data = json.loads(cache_path.read_text())
+            print(f"  cache: hit {cache_path.relative_to(REPO_ROOT)}")
+            return data
+        except json.JSONDecodeError as exc:
+            print(f"  cache: corrupt {cache_path.relative_to(REPO_ROOT)} ({exc}); deleting and re-fetching")
+            cache_path.unlink(missing_ok=True)
     data = http_get_json(url)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(json.dumps(data))
+    _atomic_write_text(cache_path, json.dumps(data))
     print(f"  cache: fetched {cache_path.relative_to(REPO_ROOT)}")
     return data
 
@@ -175,7 +199,7 @@ def ensure_ripencc_file(path: Path, refresh: bool) -> bool:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
             data = resp.read()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
+        _atomic_write_bytes(path, data)
         print(f"cache: fetched {path.relative_to(REPO_ROOT)} ({len(data)} bytes)")
         return True
     except Exception as exc:  # noqa: BLE001 - best-effort, fall back gracefully
@@ -217,27 +241,40 @@ def primary_resolver_nameservers() -> list:
 def load_ru_asns(path: Path) -> set:
     """Parse the RIPE NCC delegated file into the set of ASN numbers registered
     to country RU. Lines are 'ripencc|RU|asn|<start>|<count>|...'; each asn
-    line denotes the ASN range [start, start+count)."""
+    line denotes the ASN range [start, start+count).
+
+    Raises on read/parse failure (e.g. a truncated/corrupt file) -- the
+    caller self-heals by deleting and re-fetching the file once.
+    """
     ru = set()
-    try:
-        with path.open() as fh:
-            for raw in fh:
-                line = raw.strip()
-                if not line.startswith("ripencc"):
-                    continue
-                parts = line.split("|")
-                if len(parts) < 6 or parts[2] != "asn":
-                    continue
-                # Skip '*' summary lines (e.g. "ripencc|*|asn|*|N|summary").
-                if not (parts[3].lstrip("+").isdigit() and parts[4].lstrip("+").isdigit()):
-                    continue
-                cc, start, count = parts[1], int(parts[3]), int(parts[4])
-                if cc == "RU":
-                    ru.update(range(start, start + count))
-    except Exception as exc:  # noqa: BLE001 - treat as empty on parse failure
-        print(f"WARNING: failed to parse {path}: {exc}")
-        return set()
+    with path.open() as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line.startswith("ripencc"):
+                continue
+            parts = line.split("|")
+            if len(parts) < 6 or parts[2] != "asn":
+                continue
+            # Skip '*' summary lines (e.g. "ripencc|*|asn|*|N|summary").
+            if not (parts[3].lstrip("+").isdigit() and parts[4].lstrip("+").isdigit()):
+                continue
+            cc, start, count = parts[1], int(parts[3]), int(parts[4])
+            if cc == "RU":
+                ru.update(range(start, start + count))
     return ru
+
+
+def as_holder(asn: str, refresh: bool, cache_dir: Path) -> str:
+    """AS holder/name from RIPEstat as-overview, cached like the other
+    RIPEstat calls. Best-effort: any failure returns '-' and never affects
+    the caller's mode decision."""
+    cache_path = cache_dir / f"as-overview-AS{asn}.json"
+    try:
+        data = fetch_cached_json(AS_OVERVIEW_URL.format(asn=asn), cache_path, refresh)
+        return data.get("data", {}).get("holder") or "-"
+    except Exception as exc:  # noqa: BLE001 - best-effort, never affects mode decision
+        print(f"WARNING: failed to fetch AS holder for AS{asn}: {exc}")
+        return "-"
 
 
 def asn_country(asn_str, ru_asns: set) -> str:
@@ -374,7 +411,20 @@ def main() -> int:
     if not args.no_asn:
         ripencc_ok = ensure_ripencc_file(ripencc_path, args.refresh)
         if ripencc_ok:
-            ru_asns = load_ru_asns(ripencc_path)
+            try:
+                ru_asns = load_ru_asns(ripencc_path)
+            except Exception as exc:  # noqa: BLE001 - self-heal: delete and re-fetch once
+                print(f"cache: corrupt {ripencc_path.relative_to(REPO_ROOT)} ({exc}); deleting and re-fetching")
+                ripencc_path.unlink(missing_ok=True)
+                if ensure_ripencc_file(ripencc_path, refresh=True):
+                    try:
+                        ru_asns = load_ru_asns(ripencc_path)
+                    except Exception as exc2:  # noqa: BLE001 - fall back as before
+                        print(f"WARNING: {ripencc_path.relative_to(REPO_ROOT)} still fails to parse after re-fetch: {exc2}")
+                        ru_asns = set()
+                else:
+                    print(f"WARNING: failed to re-fetch {ripencc_path.relative_to(REPO_ROOT)} after parse failure")
+                    ru_asns = set()
 
     resolved_direct = []  # (host, ip), one per resolved address (for checks)
     domain_records = []   # per-domain reporting records
@@ -413,7 +463,11 @@ def main() -> int:
             if ni:
                 data = ni.get("data", {})
                 asn_list = data.get("asns") or []
-                holder = data.get("holder") or "-"
+                # network-info does not return a holder name -- fetch it
+                # separately (as-overview), cached per ASN. Best-effort: a
+                # failure here only prints '-' and never changes 'mode'.
+                if asn_list:
+                    holder = as_holder(asn_list[0], args.refresh, ripestat_dir)
 
                 if override == "asn":
                     mode = "asn"
