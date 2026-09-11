@@ -1,0 +1,15 @@
+# Expected AmneziaVPN split-tunneling mode, read by bin/split-health.sh so
+# it knows what "correct" looks like for the personal VPN's route count
+# (see check 2 in that script's own header comment):
+#
+#   forward  "only selected sites use VPN" (Amnezia's default here) --
+#            build/amnezia-sites.json imported, hundreds of routes expected
+#            on the personal utun.
+#   exclude  "all sites except the listed ones" -- build/amnezia-exclude.json
+#            imported, only ~4 fixed half-space routes expected.
+#
+# Keep this in sync with whichever list you most recently imported into
+# AmneziaVPN -- see the README section "Режимы AmneziaVPN". A mismatch here
+# makes bin/split-health.sh misreport check 2 (it will compare the live
+# route count against the wrong expectation).
+MODE=forward

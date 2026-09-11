@@ -128,6 +128,27 @@ dns-guard-status: ## Show whether the guard daemon is loaded, plus the last log 
 		echo "no log yet"; \
 	fi
 
+##@ Split-health monitor
+.PHONY: health
+health: ## Dry-run: what the split-tunnel health monitor would report/send right now
+	@sh "$(ROOT)/bin/split-health.sh" --config "$(CONFIG)" --dry-run
+
+.PHONY: health-status
+health-status: ## Show the monitor's last reported state per check and recent log lines
+	@sh "$(ROOT)/bin/split-health.sh" --config "$(CONFIG)" --status
+
+.PHONY: health-install
+health-install: ## Install and load the split-health LaunchAgent (no sudo)
+	@sh "$(ROOT)/bin/install-split-health.sh" --config "$(CONFIG)" --apply
+
+.PHONY: health-uninstall
+health-uninstall: ## Stop and remove the split-health LaunchAgent (no sudo)
+	@sh "$(ROOT)/bin/install-split-health.sh" --config "$(CONFIG)" --uninstall
+
+.PHONY: health-test-telegram
+health-test-telegram: ## Send exactly one test Telegram message via the monitor's own credentials
+	@sh "$(ROOT)/bin/split-health.sh" --config "$(CONFIG)" --test-telegram
+
 ##@ Corporate VPN connect
 .PHONY: cp-connect
 cp-connect: ## Connect the corporate VPN quickly by shrinking the routing table first
