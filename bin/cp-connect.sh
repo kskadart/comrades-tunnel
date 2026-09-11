@@ -46,23 +46,53 @@
 # privileged daemon, so there is no privilege-escalation path for a
 # writable ancestor to exploit.
 #
+# --method routes additionally: counts route add/delete successes and
+# failures instead of silently swallowing them (a failed restore prints a
+# prominent warning and the manual one-liner again, and makes the script
+# exit non-zero even if everything else finished); verifies after restore
+# that the route count on the personal VPN's utun matches what was saved,
+# and says plainly if that utun is not even present rather than reporting a
+# confusing count mismatch; and normalises netstat's compact destination
+# notation (e.g. "5.32/13", or a bare "1" for 1.0.0.0/8) to an explicit
+# a.b.c.d/len form before it is saved or replayed through `route`, since the
+# bare form is genuinely ambiguous. `--self-test` exercises that
+# normalisation against a fixed table of inputs/outputs.
+#
+# The corporate-VPN wait does not rely on CORP_TUNNEL_PREFIX alone: Check
+# Point assigns its Office Mode address dynamically (the third octet has
+# been observed to change every session), so any utun that gains an inet
+# address during the wait and is not the personal VPN's utun is also
+# treated as the corporate VPN coming up, with a note suggesting a broader
+# prefix, and a timeout dumps the current utun list instead of failing
+# silently. If the corporate VPN already looks connected at startup, the
+# script refuses to proceed (nothing is touched) rather than report a
+# meaningless near-instant connect time; --force overrides this and the
+# summary then reports the connect time as n/a instead of a bogus number.
+#
 # --dry-run prints every step and every command it would run, touching
 # nothing (including no `sudo -n true` check, so it always works whether or
 # not the caller has cached sudo credentials).
 #
 # Usage: cp-connect.sh [--config DIR] [--method prompt|launchd|routes|ipc]
-#                       [--dry-run] [--timeout N]
+#                       [--dry-run] [--timeout N] [--force] [--self-test]
 
 set -u
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+ORIG_CMDLINE="$0 $*"
 
 CONFIG_DIR="$REPO_ROOT/local"
 METHOD="prompt"
 DRY_RUN=0
+FORCE=0
 TIMEOUT=60
 CORP_TIMEOUT=300   # corporate-connect wait; not exposed as a flag, see header
+SELF_TEST=0
+RESTORE_HAD_FAILURES=0    # set by restore_saved_routes on any failed route add
+RESTORE_VERIFY_FAILED=0   # set by verify_restore on a post-restore mismatch
+CONNECT_TIMED_OUT=0       # set when the corporate-VPN wait times out
+CORP_ALREADY_PRESENT=""   # "iface ip" if the corporate VPN was already up at startup
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -86,6 +116,14 @@ while [ $# -gt 0 ]; do
             DRY_RUN=1
             shift
             ;;
+        --force)
+            FORCE=1
+            shift
+            ;;
+        --self-test)
+            SELF_TEST=1
+            shift
+            ;;
         --timeout)
             TIMEOUT=$2
             shift 2
@@ -95,7 +133,7 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         *)
-            echo "Usage: $0 [--config DIR] [--method prompt|launchd|routes|ipc] [--dry-run] [--timeout N]" >&2
+            echo "Usage: $0 [--config DIR] [--method prompt|launchd|routes|ipc] [--dry-run] [--timeout N] [--force] [--self-test]" >&2
             exit 2
             ;;
     esac
@@ -115,6 +153,75 @@ case "$TIMEOUT" in
         exit 2
         ;;
 esac
+
+# normalize_dest DEST -- expand netstat's compact "destination" notation
+# into an explicit, unambiguous a.b.c.d/len (or unchanged host/"default")
+# before it is written to SAVED_ROUTES_FILE or fed to `route add/delete
+# -net`. netstat -rn -f inet prints a network destination with trailing
+# zero octets dropped and, when the mask differs from the classful default
+# for that network, an explicit "/len" suffix (e.g. "5.32/13" for
+# 5.32.0.0/13); when the mask happens to equal the classful default it
+# drops the slash entirely too (e.g. a bare "1" for the class-A network
+# 1.0.0.0/8) -- that bare form is genuinely ambiguous if handed back to
+# `route` as-is, which is what this normalises. Already-explicit
+# a.b.c.d/len values, plain host addresses, and "default" pass through
+# unchanged.
+normalize_dest() {
+    dest=$1
+    case "$dest" in
+        default)
+            echo "$dest"
+            ;;
+        */*)
+            addr=${dest%/*}
+            plen=${dest#*/}
+            oldifs=$IFS
+            IFS=.
+            set -- $addr
+            IFS=$oldifs
+            printf '%s.%s.%s.%s/%s\n' "${1:-0}" "${2:-0}" "${3:-0}" "${4:-0}" "$plen"
+            ;;
+        *.*)
+            echo "$dest"
+            ;;
+        *)
+            echo "${dest}.0.0.0/8"
+            ;;
+    esac
+}
+
+# --self-test: exercise normalize_dest against a fixed table of
+# inputs/expected outputs, independent of any config directory.
+run_self_test() {
+    fail=0
+    test_case() {
+        actual=$(normalize_dest "$1")
+        if [ "$actual" = "$2" ]; then
+            echo "PASS  normalize_dest '$1' -> '$actual'"
+        else
+            echo "FAIL  normalize_dest '$1' -> '$actual' (expected '$2')"
+            fail=1
+        fi
+    }
+    test_case "1" "1.0.0.0/8"
+    test_case "5.32/13" "5.32.0.0/13"
+    test_case "128.204.80/20" "128.204.80.0/20"
+    test_case "10.8.1.1" "10.8.1.1"
+    test_case "1.1.1.1/32" "1.1.1.1/32"
+    test_case "default" "default"
+    test_case "172.16/12" "172.16.0.0/12"
+    if [ "$fail" = 0 ]; then
+        echo "self-test: all cases PASS"
+    else
+        echo "self-test: at least one case FAILED" >&2
+    fi
+    return "$fail"
+}
+
+if [ "$SELF_TEST" = 1 ]; then
+    run_self_test
+    exit $?
+fi
 
 TUNNELS_FILE="$CONFIG_DIR/tunnels.txt"
 if [ ! -f "$TUNNELS_FILE" ]; then
@@ -166,6 +273,36 @@ list_utuns() {
         found=1
     done
     [ "$found" = 0 ] && echo "  (no utun interfaces)"
+}
+
+# utuns_with_inet -- print, one per line, every utunN that currently has an
+# inet address (used to snapshot "already up before we started" interfaces
+# for the corporate-VPN wait, see wait_for_corp_utun/detect_corp_present).
+utuns_with_inet() {
+    for iface in $(ifconfig -l 2>/dev/null | tr ' ' '\n' | grep '^utun'); do
+        ip=$(ifconfig "$iface" 2>/dev/null | awk '/inet /{print $2}')
+        [ -n "$ip" ] && echo "$iface"
+    done
+}
+
+# detect_corp_present -- one-shot (non-polling) check for whether a
+# corporate-VPN utun is already up right now: the same rule
+# wait_for_corp_utun polls for, minus the "new since startup" part (there is
+# no "since startup" yet -- this runs at startup, before any wait). Echoes
+# "iface ip" and returns 0 on a hit, prints nothing and returns 1 otherwise.
+detect_corp_present() {
+    hit=$(detect_utun_by_prefix "$CORP_TUNNEL_PREFIX")
+    if [ -n "$hit" ]; then
+        echo "$hit $(ifconfig "$hit" 2>/dev/null | awk '/inet /{print $2}')"
+        return 0
+    fi
+    personal_now=$(detect_utun_by_prefix "$PERSONAL_TUNNEL_PREFIX")
+    for iface in $(utuns_with_inet); do
+        [ "$iface" = "$personal_now" ] && continue
+        echo "$iface $(ifconfig "$iface" 2>/dev/null | awk '/inet /{print $2}')"
+        return 0
+    done
+    return 1
 }
 
 # Total route count exactly as `netstat -rn -f inet | wc -l` -- matches the
@@ -224,6 +361,59 @@ wait_for_utun_present() {
     return 0
 }
 
+# wait_for_corp_utun BOUND -- poll every 2s, up to BOUND seconds, for the
+# corporate VPN's utun to appear. Check Point assigns its Office Mode
+# address dynamically (the third octet has been observed to change every
+# session), so a fixed CORP_TUNNEL_PREFIX is brittle on its own: treat as
+# "the corporate VPN came up" either (i) a utun matching CORP_TUNNEL_PREFIX,
+# or (ii) any utun that gained an inet address since STARTUP_UTUNS was
+# captured and is not the personal VPN's utun. On (ii) it names the
+# interface and address actually seen and suggests a broader prefix. On
+# timeout it dumps the current utun list instead of failing silently.
+wait_for_corp_utun() {
+    bound=$1
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "  (dry-run: would poll every 2s, up to ${bound}s, for a utun matching ${CORP_TUNNEL_PREFIX}*, or any new non-personal utun that gains an inet address)"
+        echo "  (dry-run: a timeout would instead print the full utun list, the configured prefix, and a note that Check Point's address is dynamic -- for example, right now:)"
+        list_utuns
+        echo "    configured CORP_TUNNEL_PREFIX: $CORP_TUNNEL_PREFIX"
+        return 0
+    fi
+    start=$(date +%s)
+    while :; do
+        hit=$(detect_utun_by_prefix "$CORP_TUNNEL_PREFIX")
+        if [ -n "$hit" ]; then
+            now=$(date +%s)
+            echo "  corporate VPN interface $hit appeared after $((now - start))s (matched CORP_TUNNEL_PREFIX)."
+            return 0
+        fi
+        personal_now=$(detect_utun_by_prefix "$PERSONAL_TUNNEL_PREFIX")
+        for iface in $(utuns_with_inet); do
+            case " $STARTUP_UTUNS " in
+                *" $iface "*) continue ;;   # already up before we started
+            esac
+            [ "$iface" = "$personal_now" ] && continue   # that's the personal VPN, not corporate
+            ip=$(ifconfig "$iface" 2>/dev/null | awk '/inet /{print $2}')
+            now=$(date +%s)
+            echo "  corporate VPN interface $iface appeared after $((now - start))s with address $ip (did not match CORP_TUNNEL_PREFIX '$CORP_TUNNEL_PREFIX')."
+            suggested="$(echo "$ip" | cut -d. -f1-2)."
+            echo "  NOTE: CORP_TUNNEL_PREFIX in tunnels.txt does not match this address; consider broadening it to '$suggested'."
+            return 0
+        done
+        now=$(date +%s)
+        elapsed=$((now - start))
+        if [ "$elapsed" -ge "$bound" ]; then
+            echo "  TIMEOUT after ${elapsed}s waiting for the corporate VPN interface to appear."
+            echo "  current utun interfaces:"
+            list_utuns
+            echo "  configured CORP_TUNNEL_PREFIX: $CORP_TUNNEL_PREFIX"
+            echo "  Check Point's Office Mode address is assigned dynamically and can differ every session -- if the corporate VPN did connect, this prefix probably just does not match it; broaden CORP_TUNNEL_PREFIX in tunnels.txt (see the interfaces above)."
+            return 1
+        fi
+        sleep 2
+    done
+}
+
 # --- method: prompt (default, never sudo) ---
 
 prompt_down() {
@@ -236,47 +426,89 @@ prompt_up() {
 
 # --- method: routes (sudo) ---
 
+# manual_restore_hint -- print the one-liner that restores SAVED_ROUTES_FILE
+# by hand. Printed up front (before anything is deleted) and reprinted by
+# restore_saved_routes/verify_restore on any failure, so it must stay a
+# single source of truth for that command.
+manual_restore_hint() {
+    echo "  while read -r dest gw; do case \"\$gw\" in utun*) sudo route -n -q add -net \"\$dest\" -interface \"\$gw\";; *) sudo route -n -q add -net \"\$dest\" \"\$gw\";; esac; done < $SAVED_ROUTES_FILE"
+}
+
 # save_amnezia_routes IFACE -- write "destination gateway" pairs for every
-# route whose Netif is IFACE to SAVED_ROUTES_FILE, in the exact compact
-# notation netstat/route already share (e.g. "5.32/13"), which round-trips
-# straight back into `route add/delete -net`.
+# route whose Netif is IFACE to SAVED_ROUTES_FILE, normalising each
+# destination out of netstat's compact notation (see normalize_dest) so the
+# file on disk -- and the manual one-liner printed from it -- are
+# unambiguous.
 save_amnezia_routes() {
     iface=$1
     mkdir -p "$BUILD_DIR"
-    netstat -rn -f inet 2>/dev/null | awk -v i="$iface" '$NF==i {print $1, $2}' >"$SAVED_ROUTES_FILE"
+    : >"$SAVED_ROUTES_FILE"
+    netstat -rn -f inet 2>/dev/null | awk -v i="$iface" '$NF==i {print $1, $2}' |
+    while read -r dest gw; do
+        [ -z "$dest" ] && continue
+        ndest=$(normalize_dest "$dest")
+        echo "$ndest $gw" >>"$SAVED_ROUTES_FILE"
+    done
 }
 
 # delete_amnezia_routes IFACE -- delete every route currently pointing at
-# IFACE. In --dry-run, SAVED_ROUTES_FILE does not exist yet (nothing is
-# written to disk in dry-run), so the preview is computed straight from the
-# live table instead; in a real run it reads SAVED_ROUTES_FILE (already
-# written by save_amnezia_routes) with `read`, never sourcing/eval'ing it --
-# fields are passed to `route` as literal, quoted arguments only.
+# IFACE, counting successes/failures instead of silencing them (the first
+# few failures, with their stderr, are shown; the rest are just counted so a
+# systematic failure does not flood the terminal). In --dry-run,
+# SAVED_ROUTES_FILE does not exist yet (nothing is written to disk in
+# dry-run), so the preview is computed straight from the live table instead;
+# in a real run it reads SAVED_ROUTES_FILE (already written by
+# save_amnezia_routes, already normalised) with `read`, never sourcing/
+# eval'ing it -- fields are passed to `route` as literal, quoted arguments
+# only.
 delete_amnezia_routes() {
     iface=$1
     if [ "$DRY_RUN" = 1 ]; then
         netstat -rn -f inet 2>/dev/null | awk -v i="$iface" '$NF==i {print $1}' |
         while read -r dest; do
             [ "$dest" = "default" ] && continue   # never touch the default route
-            echo "  would run: sudo route -n -q delete -net \"$dest\""
+            ndest=$(normalize_dest "$dest")
+            echo "  would run: sudo route -n -q delete -net \"$ndest\""
         done
         return 0
     fi
+    del_ok=0
+    del_fail=0
+    del_fail_detail=""
+    fail_cap=10
     while read -r dest _gw; do
         [ -z "$dest" ] && continue
         [ "$dest" = "default" ] && continue   # never touch the default route
-        sudo route -n -q delete -net "$dest" >/dev/null 2>&1 || true
+        err=$(sudo route -n -q delete -net "$dest" 2>&1 >/dev/null)
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            del_ok=$((del_ok + 1))
+        else
+            del_fail=$((del_fail + 1))
+            if [ "$del_fail" -le "$fail_cap" ]; then
+                del_fail_detail="${del_fail_detail}    sudo route -n -q delete -net \"$dest\"  ->  ${err:-(no output, exit $rc)}\n"
+            fi
+        fi
     done <"$SAVED_ROUTES_FILE"
+    echo "Deleted routes from $iface: $del_ok succeeded, $del_fail failed."
+    if [ "$del_fail" -gt 0 ]; then
+        printf '%b' "$del_fail_detail"
+        [ "$del_fail" -gt "$fail_cap" ] && echo "  (showing first $fail_cap of $del_fail failures)"
+    fi
 }
 
-# restore_saved_routes -- re-add every route from SAVED_ROUTES_FILE. A
+# restore_saved_routes -- re-add every route from SAVED_ROUTES_FILE,
+# counting successes/failures the same way delete_amnezia_routes does. A
 # gateway that is itself a utunN name means the original route was an
 # interface route (point-to-point tunnel, no separate gateway IP); anything
 # else is added with that literal gateway, matching how AmneziaVPN's own
-# router_mac.cpp calls `route add -net <ip> <gw> <mask>`. In --dry-run,
-# SAVED_ROUTES_FILE was never written (nothing is written to disk in
-# dry-run), so the preview is computed from the live table for the personal
-# utun detected at startup instead.
+# router_mac.cpp calls `route add -net <ip> <gw> <mask>`. Any failure prints
+# a prominent warning naming SAVED_ROUTES_FILE and the manual one-liner
+# again, and sets RESTORE_HAD_FAILURES so the script exits non-zero even if
+# everything else finished. In --dry-run, SAVED_ROUTES_FILE was never
+# written (nothing is written to disk in dry-run), so the preview is
+# computed from the live table for the personal utun detected at startup
+# instead.
 restore_saved_routes() {
     if [ "$DRY_RUN" = 1 ]; then
         if [ -z "$AMNEZIA_UTUN_START" ]; then
@@ -285,9 +517,10 @@ restore_saved_routes() {
         fi
         netstat -rn -f inet 2>/dev/null | awk -v i="$AMNEZIA_UTUN_START" '$NF==i {print $1, $2}' |
         while read -r dest gw; do
+            ndest=$(normalize_dest "$dest")
             case "$gw" in
-                utun*) echo "  would run: sudo route -n -q add -net \"$dest\" -interface \"$gw\"" ;;
-                *) echo "  would run: sudo route -n -q add -net \"$dest\" \"$gw\"" ;;
+                utun*) echo "  would run: sudo route -n -q add -net \"$ndest\" -interface \"$gw\"" ;;
+                *) echo "  would run: sudo route -n -q add -net \"$ndest\" \"$gw\"" ;;
             esac
         done
         return 0
@@ -296,13 +529,74 @@ restore_saved_routes() {
         echo "  (no saved-routes file at $SAVED_ROUTES_FILE, nothing to restore)"
         return 0
     fi
+    restore_ok=0
+    restore_fail=0
+    restore_fail_detail=""
+    fail_cap=10
     while read -r dest gw; do
         [ -z "$dest" ] && continue
         case "$gw" in
-            utun*) sudo route -n -q add -net "$dest" -interface "$gw" >/dev/null 2>&1 || true ;;
-            *) sudo route -n -q add -net "$dest" "$gw" >/dev/null 2>&1 || true ;;
+            utun*)
+                cmd="sudo route -n -q add -net \"$dest\" -interface \"$gw\""
+                err=$(sudo route -n -q add -net "$dest" -interface "$gw" 2>&1 >/dev/null)
+                ;;
+            *)
+                cmd="sudo route -n -q add -net \"$dest\" \"$gw\""
+                err=$(sudo route -n -q add -net "$dest" "$gw" 2>&1 >/dev/null)
+                ;;
         esac
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            restore_ok=$((restore_ok + 1))
+        else
+            restore_fail=$((restore_fail + 1))
+            if [ "$restore_fail" -le "$fail_cap" ]; then
+                restore_fail_detail="${restore_fail_detail}    $cmd  ->  ${err:-(no output, exit $rc)}\n"
+            fi
+        fi
     done <"$SAVED_ROUTES_FILE"
+    echo "Restored routes: $restore_ok succeeded, $restore_fail failed (of $((restore_ok + restore_fail)) saved)."
+    if [ "$restore_fail" -gt 0 ]; then
+        printf '%b' "$restore_fail_detail"
+        [ "$restore_fail" -gt "$fail_cap" ] && echo "  (showing first $fail_cap of $restore_fail failures)"
+        echo
+        echo "WARNING: $restore_fail route(s) failed to restore; the personal VPN's routing may be incomplete."
+        echo "Saved routes are in $SAVED_ROUTES_FILE -- to retry by hand:"
+        manual_restore_hint
+        RESTORE_HAD_FAILURES=1
+    fi
+}
+
+# verify_restore -- after restore_saved_routes, confirm the personal VPN's
+# route count actually came back to what was saved. Reports loudly (with
+# both numbers) and marks the run failed on a mismatch; separately reports
+# the personal-VPN utun being altogether absent, since that is not a
+# route-count problem and would only confuse if reported as one.
+verify_restore() {
+    [ "$DRY_RUN" = 1 ] && return 0
+    [ ! -f "$SAVED_ROUTES_FILE" ] && return 0   # nothing was saved this run
+    saved_count=$(wc -l <"$SAVED_ROUTES_FILE" | tr -d ' ')
+    utun_now=$(detect_utun_by_prefix "$PERSONAL_TUNNEL_PREFIX")
+    if [ -z "$utun_now" ]; then
+        echo
+        echo "ERROR: the personal VPN interface (prefix $PERSONAL_TUNNEL_PREFIX) is not present after restore -- cannot verify the $saved_count saved routes came back." >&2
+        echo "Reconnect AmneziaVPN, then check its routes once it is back." >&2
+        echo "Saved routes are in $SAVED_ROUTES_FILE -- to restore by hand once the tunnel is back:" >&2
+        manual_restore_hint >&2
+        RESTORE_VERIFY_FAILED=1
+        return 1
+    fi
+    now_count=$(netstat -rn -f inet 2>/dev/null | awk -v i="$utun_now" '$NF==i' | wc -l | tr -d ' ')
+    if [ "$now_count" != "$saved_count" ]; then
+        echo
+        echo "ERROR: route count mismatch after restore: saved $saved_count, now $now_count routes point at $utun_now." >&2
+        echo "Saved routes are in $SAVED_ROUTES_FILE -- to restore by hand:" >&2
+        manual_restore_hint >&2
+        RESTORE_VERIFY_FAILED=1
+        return 1
+    fi
+    echo "Verified: $now_count/$saved_count routes are back on $utun_now."
+    return 0
 }
 
 # --- method: launchd (sudo) ---
@@ -358,12 +652,48 @@ echo "=== cp-connect: shrink the routing table while the corporate VPN connects 
 echo "Config dir: $CONFIG_DIR"
 echo "Method: $METHOD"
 [ "$DRY_RUN" = 1 ] && echo "Mode: --dry-run (no changes will be made)"
+[ "$FORCE" = 1 ] && echo "Mode: --force (the already-connected refusal below, if it applies, is a warning instead)"
 echo "Personal-VPN wait timeout: ${TIMEOUT}s   Corporate-VPN wait timeout: ${CORP_TIMEOUT}s (fixed)"
 echo
 
+echo "--- starting state ---"
+echo "utuns:"
+list_utuns
+BEFORE_TOTAL=$(route_count)
+echo "total routes (netstat -rn -f inet | wc -l): $BEFORE_TOTAL"
+STARTUP_UTUNS=$(utuns_with_inet | tr '\n' ' ')
+echo "utuns with an inet address already up at startup (excluded as \"new\" for corporate-VPN detection): ${STARTUP_UTUNS:-<none>}"
+echo
+
+AMNEZIA_UTUN_START=$(detect_utun_by_prefix "$PERSONAL_TUNNEL_PREFIX")
+
+CORP_HIT=$(detect_corp_present)
+if [ -n "$CORP_HIT" ]; then
+    corp_iface=${CORP_HIT% *}
+    corp_ip=${CORP_HIT#* }
+    echo "NOTE: the corporate VPN already looks connected ($corp_iface, inet $corp_ip)."
+    echo "The connect time this script measures is only meaningful if it starts disconnected."
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "(dry-run preview: a live run would refuse and stop here -- see below -- unless --force is given; continuing the preview.)"
+        CORP_ALREADY_PRESENT="$CORP_HIT"
+    elif [ "$FORCE" = 1 ]; then
+        echo "Continuing anyway because --force was given; the connect time will be reported as n/a."
+        CORP_ALREADY_PRESENT="$CORP_HIT"
+    else
+        echo
+        echo "ERROR: refusing to start -- nothing has been touched. To proceed:" >&2
+        echo "  1. Disconnect the corporate Check Point VPN." >&2
+        echo "  2. Re-run:  $ORIG_CMDLINE" >&2
+        echo "  3. Follow the prompts." >&2
+        echo "(Pass --force to skip this check and run anyway; the connect time will then be reported as n/a.)" >&2
+        exit 1
+    fi
+    echo
+fi
+
 if [ "$METHOD" = "routes" ]; then
     echo "If this script is interrupted after routes are deleted, restore them by hand with:"
-    echo "  while read -r dest gw; do case \"\$gw\" in utun*) sudo route -n -q add -net \"\$dest\" -interface \"\$gw\";; *) sudo route -n -q add -net \"\$dest\" \"\$gw\";; esac; done < $SAVED_ROUTES_FILE"
+    manual_restore_hint
     echo
 fi
 
@@ -380,15 +710,6 @@ if [ "$METHOD" = "launchd" ] || [ "$METHOD" = "routes" ]; then
     fi
     echo
 fi
-
-echo "--- starting state ---"
-echo "utuns:"
-list_utuns
-BEFORE_TOTAL=$(route_count)
-echo "total routes (netstat -rn -f inet | wc -l): $BEFORE_TOTAL"
-echo
-
-AMNEZIA_UTUN_START=$(detect_utun_by_prefix "$PERSONAL_TUNNEL_PREFIX")
 
 RESTORE_DONE=0
 # Restore the personal VPN exactly once, no matter how the script ends: a
@@ -408,6 +729,7 @@ restore_personal_vpn() {
             ;;
         routes)
             restore_saved_routes
+            verify_restore
             ;;
         launchd)
             launchd_up
@@ -462,18 +784,26 @@ DURING_TOTAL=$(route_count)
 echo
 echo "--- corporate VPN connect ---"
 echo "total routes (netstat -rn -f inet | wc -l) now: $DURING_TOTAL"
-echo "ACTION NEEDED: connect the corporate Check Point VPN now."
-echo "Waiting up to ${CORP_TIMEOUT}s for a utun with inet ${CORP_TUNNEL_PREFIX}* to appear..."
-CONNECT_START=$(date +%s)
-wait_for_utun_present "$CORP_TUNNEL_PREFIX" "$CORP_TIMEOUT" "the corporate VPN interface"
-CONNECT_RESULT=$?
-CONNECT_ELAPSED=$(( $(date +%s) - CONNECT_START ))
-if [ "$DRY_RUN" = 1 ]; then
-    CONNECT_ELAPSED="n/a"
-elif [ "$CONNECT_RESULT" = 0 ]; then
-    echo "Corporate VPN connected in ${CONNECT_ELAPSED}s."
+if [ -n "$CORP_ALREADY_PRESENT" ]; then
+    echo "Corporate VPN is already connected (see NOTE above) -- not waiting for it; the connect time cannot be measured this run."
+    CONNECT_RESULT=0
+    CONNECT_ELAPSED="n/a (corporate VPN was already connected)"
 else
-    echo "Corporate VPN did not connect within ${CORP_TIMEOUT}s; restoring the personal VPN anyway."
+    echo "ACTION NEEDED: connect the corporate Check Point VPN now."
+    echo "Waiting up to ${CORP_TIMEOUT}s for a utun matching ${CORP_TUNNEL_PREFIX}*, or any new non-personal utun, to appear..."
+    CONNECT_START=$(date +%s)
+    wait_for_corp_utun "$CORP_TIMEOUT"
+    CONNECT_RESULT=$?
+    if [ "$DRY_RUN" = 1 ]; then
+        CONNECT_ELAPSED="n/a (dry-run)"
+    elif [ "$CONNECT_RESULT" = 0 ]; then
+        CONNECT_ELAPSED=$(( $(date +%s) - CONNECT_START ))
+        echo "Corporate VPN connected in ${CONNECT_ELAPSED}s."
+    else
+        CONNECT_ELAPSED="n/a (did not connect within ${CORP_TIMEOUT}s)"
+        CONNECT_TIMED_OUT=1
+        echo "Corporate VPN did not connect within ${CORP_TIMEOUT}s; restoring the personal VPN anyway."
+    fi
 fi
 
 restore_personal_vpn
@@ -486,6 +816,13 @@ printf '  %-8s %s\n' "before" "$BEFORE_TOTAL"
 printf '  %-8s %s\n' "during" "$DURING_TOTAL"
 printf '  %-8s %s\n' "after" "$AFTER_TOTAL"
 echo
-echo "Corporate VPN connect time: ${CONNECT_ELAPSED}s"
+case "$CONNECT_ELAPSED" in
+    n/a*) echo "Corporate VPN connect time: $CONNECT_ELAPSED" ;;
+    *) echo "Corporate VPN connect time: ${CONNECT_ELAPSED}s" ;;
+esac
 
-exit 0
+EXIT_CODE=0
+[ "$RESTORE_HAD_FAILURES" = 1 ] && EXIT_CODE=1
+[ "$RESTORE_VERIFY_FAILED" = 1 ] && EXIT_CODE=1
+[ "$CONNECT_TIMED_OUT" = 1 ] && EXIT_CODE=1
+exit "$EXIT_CODE"

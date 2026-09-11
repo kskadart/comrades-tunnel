@@ -7,5 +7,10 @@
 # VPN. Set each prefix to that interface's inet prefix, including the final
 # dot. Replace the placeholder values below with your real ones; keep both
 # lines exactly in KEY=VALUE form.
+#
+# CORP_TUNNEL_PREFIX: the corporate client may assign a different address
+# each session (e.g. Check Point's Office Mode address is dynamic), so keep
+# this prefix broad -- its first two octets plus a trailing dot is usually
+# right -- rather than narrowing it to one session's exact address.
 CORP_TUNNEL_PREFIX=REPLACE_WITH_CORP_UTUN_PREFIX
 PERSONAL_TUNNEL_PREFIX=REPLACE_WITH_PERSONAL_UTUN_PREFIX
