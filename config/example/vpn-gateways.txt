@@ -1,0 +1,16 @@
+# Corporate VPN (Check Point) gateway IPs the client connects to.
+#
+# What belongs here: the corporate VPN client's OWN gateway endpoints -- the
+# specific IPs/CIDRs it handshakes with to build its tunnel. NOT the corporate
+# netblocks in general (those belong in direct-cidrs.txt and are always routed
+# directly).
+#
+# Whether these gateways go through the personal VPN is controlled by the
+# generator's --gateway-mode flag:
+#   - direct (default): each gateway here is excluded from the personal VPN
+#     site list, so the corporate client reaches it via the physical interface.
+#   - tunnel: each gateway here stays inside the personal VPN site list, so the
+#     corporate client's own traffic travels THROUGH your personal VPN.
+#
+# One IP or CIDR per line; '#' starts a comment.
+# 203.0.113.10/32

@@ -48,6 +48,12 @@ sites: ## Generate the AmneziaVPN site list into build/
 	@echo
 	@echo "Reminder: import $(ROOT)/build/amnezia-sites.json in AmneziaVPN (Split tunneling -> \"⋮\" -> \"Replace site list\") and reconnect."
 
+.PHONY: sites-tunnel
+sites-tunnel: ## Generate the site list with the corporate VPN gateway routed through the personal VPN
+	@python3 "$(ROOT)/bin/gen-amnezia-sites.py" --config "$(CONFIG)" --gateway-mode tunnel
+	@echo
+	@echo "Reminder: import $(ROOT)/build/amnezia-sites.json in AmneziaVPN (Split tunneling -> \"⋮\" -> \"Replace site list\") and reconnect."
+
 .PHONY: sites-refresh
 sites-refresh: ## Same, forcing a re-download of the RIPE/RIPEstat cache
 	@python3 "$(ROOT)/bin/gen-amnezia-sites.py" --config "$(CONFIG)" --refresh
@@ -62,6 +68,10 @@ sites-offline: ## Same, without ASN expansion (--no-asn)
 .PHONY: check
 check: ## Check the actual split routing (read-only)
 	@sh "$(ROOT)/bin/check-split.sh" --config "$(CONFIG)"
+
+.PHONY: check-tunnel
+check-tunnel: ## Check routing with the gateway expected inside the personal VPN
+	@sh "$(ROOT)/bin/check-split.sh" --config "$(CONFIG)" --gateway-mode tunnel
 
 .PHONY: resolvers
 resolvers: ## Dry-run: what /etc/resolver files would change

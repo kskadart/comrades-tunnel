@@ -10,7 +10,7 @@
 #   - egress IP via the default route vs. forced out en0
 #   - route counts per utun interface
 #
-# Usage: check-split.sh [--config DIR]
+# Usage: check-split.sh [--config DIR] [--gateway-mode {direct,tunnel}]
 # Exit code: 0 if every expectation PASSed, 1 otherwise.
 
 set -u
@@ -18,6 +18,7 @@ set -u
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 CONFIG_DIR="$REPO_ROOT/local"
+GATEWAY_MODE="direct"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -29,12 +30,28 @@ while [ $# -gt 0 ]; do
             CONFIG_DIR=${1#--config=}
             shift
             ;;
+        --gateway-mode)
+            GATEWAY_MODE=$2
+            shift 2
+            ;;
+        --gateway-mode=*)
+            GATEWAY_MODE=${1#--gateway-mode=}
+            shift
+            ;;
         *)
-            echo "Usage: $0 [--config DIR]" >&2
+            echo "Usage: $0 [--config DIR] [--gateway-mode {direct,tunnel}]" >&2
             exit 2
             ;;
     esac
 done
+
+case "$GATEWAY_MODE" in
+    direct|tunnel) ;;
+    *)
+        echo "ERROR: invalid --gateway-mode '$GATEWAY_MODE' (expected 'direct' or 'tunnel')" >&2
+        exit 2
+        ;;
+esac
 
 read_lines() {
     [ -f "$1" ] || return 0
@@ -98,11 +115,11 @@ is_rfc1918() {
     esac
 }
 
-# Known VPN gateway host-routes: any /32 entry in direct-cidrs.txt. These
-# must always reach the internet via en0 (the physical interface) -- a VPN
-# client cannot tunnel packets to its own gateway through the tunnel it's
-# building, even if the gateway's address lies inside a corporate netblock.
-GATEWAY_IPS=$(read_lines "$CONFIG_DIR/direct-cidrs.txt" | grep '/32$' | sed 's#/32$##')
+# Known corporate VPN gateway host-routes from vpn-gateways.txt. What they are
+# expected to route via follows --gateway-mode: 'direct' (default) expects them
+# on en0 (the physical interface), 'tunnel' expects them on the personal VPN's
+# utun instead.
+GATEWAY_IPS=$(read_lines "$CONFIG_DIR/vpn-gateways.txt" | sed 's#/[0-9]*$##')
 
 is_gateway_ip() {
     ip=$1
@@ -110,6 +127,15 @@ is_gateway_ip() {
         [ "$g" = "$ip" ] && return 0
     done
     return 1
+}
+
+gateway_expected_iface() {
+    # What interface a gateway IP is expected to route via, by gateway-mode.
+    if [ "$GATEWAY_MODE" = "tunnel" ]; then
+        echo "${AMNEZIA_UTUN:-Amnezia_utun}"
+    else
+        echo "en0"
+    fi
 }
 
 echo "=== corp-hosts-check.txt ==="
@@ -134,11 +160,12 @@ for host in $HOSTS; do
 
     # Expected route interface for this host, generalized (no corporate
     # netblocks hardcoded here):
-    #   - resolved IP is a /32 in direct-cidrs.txt  -> en0 (VPN gateway)
+    #   - resolved IP is a vpn-gateways.txt gateway -> gateway_expected_iface
+    #     (en0 in direct mode, personal utun in tunnel mode)
     #   - otherwise the IP is RFC 1918               -> corporate VPN utun
     #   - otherwise (public corporate host)          -> NOT the personal utun
     if is_gateway_ip "$test_ip"; then
-        expected="en0"
+        expected=$(gateway_expected_iface)
     elif is_rfc1918 "$test_ip"; then
         expected="${CP_UTUN:-CP_utun}"
     else
