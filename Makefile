@@ -108,6 +108,15 @@ dns-guard-status: ## Show whether the guard daemon is loaded, plus the last log 
 		echo "no log yet"; \
 	fi
 
+##@ Corporate VPN connect
+.PHONY: cp-connect
+cp-connect: ## Connect the corporate VPN quickly by shrinking the routing table first
+	@sh "$(ROOT)/bin/cp-connect.sh" --config "$(CONFIG)"
+
+.PHONY: cp-connect-dry
+cp-connect-dry: ## Show what cp-connect would do, without touching anything
+	@sh "$(ROOT)/bin/cp-connect.sh" --config "$(CONFIG)" --dry-run
+
 ##@ Install (sudo)
 .PHONY: resolvers-apply
 resolvers-apply: ## Write /etc/resolver/<zone> files (sudo)
