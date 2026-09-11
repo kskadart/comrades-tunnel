@@ -12,6 +12,14 @@ ROOT := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 # gitignored). Override per-invocation: make CONFIG=config/example <target>.
 CONFIG ?= local
 
+# Optional cap on the generated site list (see bin/gen-amnezia-sites.py
+# --max-sites): merges the smallest exclusion gaps until the list fits N
+# networks, trading a little precision for a much faster corporate VPN
+# connect. Empty by default, which leaves every target's behaviour
+# unchanged: make MAX_SITES=400 sites, or just make sites-small below.
+MAX_SITES ?=
+MAX_SITES_FLAG = $(if $(MAX_SITES),--max-sites $(MAX_SITES),)
+
 .DEFAULT_GOAL := help
 
 .PHONY: help
@@ -44,25 +52,31 @@ preset-ru: ## Copy the ru-popular preset over $(CONFIG)/direct-domains.txt (requ
 ##@ Generate
 .PHONY: sites
 sites: ## Generate the AmneziaVPN site list into build/
-	@python3 "$(ROOT)/bin/gen-amnezia-sites.py" --config "$(CONFIG)"
+	@python3 "$(ROOT)/bin/gen-amnezia-sites.py" --config "$(CONFIG)" $(MAX_SITES_FLAG)
 	@echo
 	@echo "Reminder: import $(ROOT)/build/amnezia-sites.json in AmneziaVPN (Split tunneling -> \"⋮\" -> \"Replace site list\") and reconnect."
 
 .PHONY: sites-tunnel
 sites-tunnel: ## Generate the site list with the corporate VPN gateway routed through the personal VPN
-	@python3 "$(ROOT)/bin/gen-amnezia-sites.py" --config "$(CONFIG)" --gateway-mode tunnel
+	@python3 "$(ROOT)/bin/gen-amnezia-sites.py" --config "$(CONFIG)" --gateway-mode tunnel $(MAX_SITES_FLAG)
 	@echo
 	@echo "Reminder: import $(ROOT)/build/amnezia-sites.json in AmneziaVPN (Split tunneling -> \"⋮\" -> \"Replace site list\") and reconnect."
 
 .PHONY: sites-refresh
 sites-refresh: ## Same, forcing a re-download of the RIPE/RIPEstat cache
-	@python3 "$(ROOT)/bin/gen-amnezia-sites.py" --config "$(CONFIG)" --refresh
+	@python3 "$(ROOT)/bin/gen-amnezia-sites.py" --config "$(CONFIG)" --refresh $(MAX_SITES_FLAG)
 	@echo
 	@echo "Reminder: import $(ROOT)/build/amnezia-sites.json in AmneziaVPN (Split tunneling -> \"⋮\" -> \"Replace site list\") and reconnect."
 
 .PHONY: sites-offline
 sites-offline: ## Same, without ASN expansion (--no-asn)
-	@python3 "$(ROOT)/bin/gen-amnezia-sites.py" --config "$(CONFIG)" --no-asn
+	@python3 "$(ROOT)/bin/gen-amnezia-sites.py" --config "$(CONFIG)" --no-asn $(MAX_SITES_FLAG)
+
+.PHONY: sites-small
+sites-small: ## Generate a compact site list (MAX_SITES, default 400) to speed up the corporate VPN connect
+	@python3 "$(ROOT)/bin/gen-amnezia-sites.py" --config "$(CONFIG)" --max-sites $(or $(MAX_SITES),400)
+	@echo
+	@echo "Reminder: import $(ROOT)/build/amnezia-sites.json in AmneziaVPN (Split tunneling -> \"⋮\" -> \"Replace site list\") and reconnect."
 
 ##@ Verify
 .PHONY: check

@@ -37,7 +37,7 @@ amnezia-vpn/amnezia-client, client/core/controllers/ipSplitTunnelingController.c
 
 Usage:
     gen-amnezia-sites.py [--config DIR] [--dry-run] [--gateway-mode {direct,tunnel}]
-                         [--no-asn] [--refresh]
+                         [--no-asn] [--refresh] [--max-sites N]
 
 direct-domains.txt syntax (optional second token after the domain):
     <domain>            expand to whole ASN when safe (RU-country, under cap)
@@ -45,6 +45,7 @@ direct-domains.txt syntax (optional second token after the domain):
     <domain> ip         force IP-only expansion (only the resolved /32s)
 """
 import argparse
+import heapq
 import ipaddress
 import json
 import os
@@ -389,6 +390,123 @@ def address_exclude_all(base_networks, exclusions):
     return sites, collapsed
 
 
+def merge_gaps_to_budget(collapsed, current_site_count, max_sites):
+    """Greedily merge the smallest gaps between consecutive collapsed
+    exclusions until the resulting site-network count is at most
+    `max_sites`, or no gaps remain.
+
+    A "gap" is the address range strictly between two consecutive entries
+    of the already-collapsed, sorted exclusion list. Merging a gap means
+    folding that range into the exclusions, so the exclusion before it,
+    the gap itself, and the exclusion after it become one contiguous
+    excluded range.
+
+    SAFETY (preserved and must hold): merging a gap only ever ADDS the
+    gap's address range to the exclusions -- it never removes or shrinks
+    an existing exclusion. So everything that was already excluded
+    (corporate CIDRs, VPN gateways, direct-domains IPs/ASN prefixes, DNS
+    servers, RFC 1918 ranges, ...) stays excluded; merging can only push
+    MORE address space out of the personal VPN, never less back in. Every
+    existing self-check therefore continues to pass unchanged (verified
+    below at the call site).
+
+    Efficiency: the number of site-CIDR-blocks a gap contributes depends
+    only on that gap's own start/end addresses, never on whether other
+    gaps are merged (merging elsewhere only changes which exclusion a gap
+    is adjacent to, not the gap's own address range). So each gap's cost
+    (site-network count removed when merged) is computed exactly once, up
+    front, and a min-heap picks the globally smallest gaps first without
+    ever recomputing the full complement -- linear in the number of
+    collapsed exclusions, not quadratic.
+
+    Returns (merged_flags, merges_performed, extra_addresses, largest_gap):
+    merged_flags[i] is True if the gap between collapsed[i] and
+    collapsed[i + 1] was merged; largest_gap is (size, start_int, end_int)
+    of the biggest merged gap, or None if no merge was needed/possible.
+    """
+    n = len(collapsed)
+    merged_flags = [False] * max(0, n - 1)
+    merges_performed = 0
+    extra_addresses = 0
+    largest_gap = None
+    if n < 2 or current_site_count <= max_sites:
+        return merged_flags, merges_performed, extra_addresses, largest_gap
+
+    heap = []  # (gap size, gap index, start, end)
+    gap_site_counts = {}  # gap index -> number of site networks it contributes
+    for i in range(n - 1):
+        start = int(collapsed[i].broadcast_address) + 1
+        end = int(collapsed[i + 1].network_address) - 1
+        if start > end:
+            # collapse_addresses() only merges two networks into one CIDR
+            # when their union is itself a valid CIDR block; two networks
+            # can otherwise sit immediately adjacent (zero addresses
+            # between them) without being combined. There is no address
+            # space to merge here, so this pair is simply not a candidate.
+            continue
+        size = end - start + 1
+        gap_site_counts[i] = sum(
+            1
+            for _ in ipaddress.summarize_address_range(
+                ipaddress.IPv4Address(start), ipaddress.IPv4Address(end)
+            )
+        )
+        heapq.heappush(heap, (size, i, start, end))
+
+    total_sites = current_site_count
+    while heap and total_sites > max_sites:
+        size, i, start, end = heapq.heappop(heap)
+        merged_flags[i] = True
+        total_sites -= gap_site_counts[i]
+        merges_performed += 1
+        extra_addresses += size
+        if largest_gap is None or size > largest_gap[0]:
+            largest_gap = (size, start, end)
+
+    return merged_flags, merges_performed, extra_addresses, largest_gap
+
+
+def apply_gap_merges(collapsed, merged_flags):
+    """Rebuild the collapsed-exclusion list and the site list after gap
+    merges chosen by merge_gaps_to_budget(). merged_flags[i] == True means
+    the gap between collapsed[i] and collapsed[i + 1] is folded into the
+    exclusions, joining both into one contiguous excluded range. A single
+    linear pass groups runs of merged exclusions and re-derives their
+    minimal CIDR representation (and that of the surviving gaps) via
+    summarize_address_range -- no full recomputation of the complement."""
+    if not collapsed:
+        return [], []
+    final_excl = []
+    final_sites = []
+    group_start = int(collapsed[0].network_address)
+    group_end = int(collapsed[0].broadcast_address)
+    for i in range(len(collapsed) - 1):
+        nxt = collapsed[i + 1]
+        if merged_flags[i]:
+            group_end = int(nxt.broadcast_address)
+        else:
+            final_excl.extend(
+                ipaddress.summarize_address_range(
+                    ipaddress.IPv4Address(group_start), ipaddress.IPv4Address(group_end)
+                )
+            )
+            gap_start, gap_end = group_end + 1, int(nxt.network_address) - 1
+            if gap_start <= gap_end:  # zero-address gaps (adjacent, unmergeable) emit nothing
+                final_sites.extend(
+                    ipaddress.summarize_address_range(
+                        ipaddress.IPv4Address(gap_start), ipaddress.IPv4Address(gap_end)
+                    )
+                )
+            group_start = int(nxt.network_address)
+            group_end = int(nxt.broadcast_address)
+    final_excl.extend(
+        ipaddress.summarize_address_range(
+            ipaddress.IPv4Address(group_start), ipaddress.IPv4Address(group_end)
+        )
+    )
+    return final_excl, final_sites
+
+
 def covered_by(ip_str: str, networks) -> bool:
     ip = ipaddress.ip_address(ip_str)
     return any(ip in net for net in networks)
@@ -426,7 +544,20 @@ def main() -> int:
         action="store_true",
         help="force re-downloading RIPEstat/RIPE caches instead of reusing them",
     )
+    parser.add_argument(
+        "--max-sites",
+        type=int,
+        default=None,
+        metavar="N",
+        help="cap the site list at N networks by greedily merging the smallest "
+             "gaps between exclusions until it fits (default: unlimited, i.e. "
+             "today's behaviour). Merging only ever ADDS address space to the "
+             "exclusions, so it can only shrink the personal VPN's coverage, "
+             "never weaken what must stay off it.",
+    )
     args = parser.parse_args()
+    if args.max_sites is not None and args.max_sites <= 0:
+        parser.error("--max-sites must be a positive integer")
 
     config_dir = Path(args.config).resolve() if args.config else (REPO_ROOT / "local")
     if not config_dir.is_dir():
@@ -651,6 +782,21 @@ def main() -> int:
     sites, collapsed_exclusions = address_exclude_all([FULL_IPV4], exclusions)
     sites.sort(key=lambda n: (int(n.network_address), n.prefixlen))
 
+    # --- Route budget (--max-sites): merge smallest gaps until it fits ------
+    # See merge_gaps_to_budget()'s docstring for the safety property (merging
+    # only ever ADDS address space to the exclusions) and why a heap over
+    # precomputed per-gap costs avoids recomputing the full complement.
+    budget_merges = budget_extra_addresses = 0
+    budget_largest_gap = None
+    if args.max_sites is not None:
+        merged_flags, budget_merges, budget_extra_addresses, budget_largest_gap = (
+            merge_gaps_to_budget(collapsed_exclusions, len(sites), args.max_sites)
+        )
+        if budget_merges:
+            collapsed_exclusions, sites = apply_gap_merges(collapsed_exclusions, merged_flags)
+            sites.sort(key=lambda n: (int(n.network_address), n.prefixlen))
+            collapsed_exclusions.sort(key=lambda n: (int(n.network_address), n.prefixlen))
+
     total_excluded = sum(net.num_addresses for net in collapsed_exclusions)
     total_covered = sum(net.num_addresses for net in sites)
 
@@ -685,6 +831,23 @@ def main() -> int:
     print(f"  site networks (covered)     : {len(sites)}")
     print(f"  total covered addresses     : {total_covered}")
     print(f"  covered + excluded          : {total_covered + total_excluded} (2^32 = {MAX_ADDR})")
+
+    if args.max_sites is not None:
+        pct = budget_extra_addresses / MAX_ADDR * 100
+        print()
+        print("=== Route budget (--max-sites) ===")
+        print(f"  requested budget            : {args.max_sites}")
+        print(f"  gap merges performed        : {budget_merges}")
+        print(f"  resulting site networks     : {len(sites)}")
+        print(f"  extra addresses excluded    : {budget_extra_addresses} ({pct:.4f}% of all IPv4)")
+        if budget_largest_gap:
+            size, start, end = budget_largest_gap
+            print(
+                f"  largest merged gap          : "
+                f"{ipaddress.IPv4Address(start)}-{ipaddress.IPv4Address(end)} ({size} addresses)"
+            )
+        else:
+            print("  largest merged gap          : none (no merge was needed/possible)")
 
     build_dir = REPO_ROOT / "build"
     json_path = build_dir / "amnezia-sites.json"
