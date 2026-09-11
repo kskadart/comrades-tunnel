@@ -137,7 +137,7 @@ tg_creds() {
 
 tg_send() {   # $1 = plain text. Prints one status line; returns 0 if HTTP 200.
     if ! tg_creds; then
-        echo "  (Telegram: Keychain lookup failed for user \$USER -- skipping send)"
+        echo "  (Telegram: Keychain lookup failed for user $USER -- skipping send)"
         return 1
     fi
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
@@ -155,7 +155,7 @@ tg_send() {   # $1 = plain text. Prints one status line; returns 0 if HTTP 200.
 
 if [ "$TEST_TELEGRAM" = 1 ]; then
     if ! tg_creds; then
-        echo "Telegram credentials did not resolve from Keychain for user \$USER (comrades-tunnel-telegram-bot-token / -chat) -- skipping test send."
+        echo "Telegram credentials did not resolve from Keychain for user $USER (comrades-tunnel-telegram-bot-token / -chat) -- skipping test send."
         exit 0
     fi
     echo "Sending exactly one test message..."
@@ -272,7 +272,7 @@ if [ -n "$AMNEZIA_UTUN" ]; then
         exclude)
             if [ "$AMNEZIA_ROUTES" -gt 50 ] 2>/dev/null; then
                 SPLIT_ABSENT_STATUS=FAIL
-                SPLIT_ABSENT_EVIDENCE="личный VPN ($AMNEZIA_UTUN) несёт $AMNEZIA_ROUTES маршрутов (ожидалось не больше ~4-50) -- похоже, импортирован не тот список или включён не тот режим в приложении"
+                SPLIT_ABSENT_EVIDENCE="личный VPN ($AMNEZIA_UTUN) несёт $AMNEZIA_ROUTES маршрутов (ожидалось около 4, допуск до 50) -- похоже, импортирован не тот список или включён не тот режим в приложении"
             else
                 SPLIT_ABSENT_EVIDENCE="личный VPN ($AMNEZIA_UTUN) несёт $AMNEZIA_ROUTES маршрутов, как и ожидается для режима exclude"
             fi
