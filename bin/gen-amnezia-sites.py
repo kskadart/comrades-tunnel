@@ -36,16 +36,43 @@ between exclusions until it fits N networks. keep-tunneled.txt pins networks
 gap containing a pinned network is never merged, however small it is. If
 the budget cannot be reached because every remaining gap is protected, the
 tool prints a WARNING and keeps the pins intact rather than exceeding the
-budget silently.
+budget silently. This works as an efficient additive budget specifically
+because each gap's own site-block count can be removed independently of
+every other merge (see merge_gaps_to_budget()'s docstring) -- once merges
+start chaining, the resulting *exclusion* entry count is a property of the
+whole fused range, not a sum of the parts, so the same trick does not carry
+over to shrinking the exclusion list. That is why `--mode exclude` (below)
+ignores `--max-sites` outright, with a WARNING, rather than offer a budget
+that cannot honestly guarantee the requested count.
+
+`--mode {forward,exclude}` selects which AmneziaVPN split-tunneling mode
+this run generates for:
+  - forward (default): today's behaviour, unchanged -- writes the *site
+    list* (the complement) for AmneziaVPN's "only selected sites" mode.
+  - exclude: writes the *exclusion set itself* -- the very same
+    `collapsed_exclusions` this script always computes internally -- for
+    AmneziaVPN's "all sites except the listed ones" mode. Client-side (see
+    MacosRouteMonitor::addExclusionRoute), that mode installs only four
+    fixed half-space routes on the personal VPN's own interface plus one
+    real kernel route per excluded network via the physical gateway, so
+    writing the (much smaller) exclusion set instead of its complement
+    cuts the installed route count dramatically -- see the README.
+  Each mode only ever touches its own two output files below; the other
+  mode's files are left untouched.
 
 Output (AmneziaVPN JSON import format -- see importSitesFromJson() in
 amnezia-vpn/amnezia-client, client/core/controllers/ipSplitTunnelingController.cpp):
-    build/amnezia-sites.json   -- [{"hostname": "<cidr>", "ips": [], "ip": ""}, ...]
-    build/amnezia-sites.txt    -- one CIDR per line, for human review
+    --mode forward (default):
+        build/amnezia-sites.json    -- [{"hostname": "<cidr>", "ips": [], "ip": ""}, ...]
+        build/amnezia-sites.txt     -- one CIDR per line, for human review
+    --mode exclude:
+        build/amnezia-exclude.json  -- same JSON shape, one entry per excluded network
+        build/amnezia-exclude.txt   -- one CIDR per line, for human review
 
 Usage:
-    gen-amnezia-sites.py [--config DIR] [--dry-run] [--gateway-mode {direct,tunnel}]
-                         [--no-asn] [--refresh] [--max-sites N]
+    gen-amnezia-sites.py [--config DIR] [--dry-run] [--mode {forward,exclude}]
+                         [--gateway-mode {direct,tunnel}] [--no-asn]
+                         [--refresh] [--max-sites N]
 
 direct-domains.txt syntax (optional second token after the domain):
     <domain>            expand to whole ASN when safe (RU-country, under cap)
@@ -565,6 +592,17 @@ def main() -> int:
         help="print what would be generated but do not write build/ files",
     )
     parser.add_argument(
+        "--mode",
+        choices=("forward", "exclude"),
+        default="forward",
+        help="which AmneziaVPN split-tunneling mode to generate for: 'forward' "
+             "(default, unchanged) writes the site list (the complement) for "
+             "\"only selected sites\" mode into build/amnezia-sites.{json,txt}; "
+             "'exclude' writes the exclusion set itself for \"all sites except "
+             "the listed ones\" mode into build/amnezia-exclude.{json,txt}. "
+             "Each mode only touches its own output files.",
+    )
+    parser.add_argument(
         "--gateway-mode",
         choices=("direct", "tunnel"),
         default="direct",
@@ -596,7 +634,10 @@ def main() -> int:
              "never weaken what must stay off it. Networks pinned in "
              "keep-tunneled.txt are never merged away; if the budget cannot "
              "be reached because of that, a WARNING is printed instead of "
-             "exceeding the budget.",
+             "exceeding the budget. Ignored (with a WARNING) in --mode exclude: "
+             "it caps the *site list* count specifically and has no equivalent "
+             "guarantee for the exclusion list's entry count once merges chain "
+             "(see the module docstring).",
     )
     args = parser.parse_args()
     if args.max_sites is not None and args.max_sites <= 0:
@@ -851,7 +892,24 @@ def main() -> int:
     budget_protected_gaps = 0
     budget_pinned_hits = {str(net): 0 for net in parsed_keep_tunneled}
     budget_met = True
-    if args.max_sites is not None:
+    # --max-sites targets the *site list* count via an additive per-gap cost
+    # (see merge_gaps_to_budget()'s docstring): each gap's own site-block
+    # count can be subtracted independently of every other merge. That
+    # property does not carry over to the *exclusion* list's entry count --
+    # once merges chain, the fused range's minimal CIDR count is a property
+    # of the whole range, not a sum of the parts -- so rather than offer a
+    # budget that cannot honestly guarantee the requested exclusion count,
+    # --mode exclude ignores --max-sites outright, loudly.
+    max_sites_applies = args.max_sites is not None and args.mode == "forward"
+    if args.max_sites is not None and args.mode == "exclude":
+        print()
+        print(
+            f"WARNING: --max-sites {args.max_sites} is ignored in --mode exclude: it caps "
+            f"the site-list count, which has no meaning here (this run writes the exclusion "
+            f"list itself). The exclusion list is written at its full precision, "
+            f"{len(collapsed_exclusions)} network(s)."
+        )
+    if max_sites_applies:
         (merged_flags, budget_merges, budget_extra_addresses, budget_largest_gap,
          budget_protected_gaps, budget_pinned_hits, budget_met) = merge_gaps_to_budget(
             collapsed_exclusions, len(sites), args.max_sites, parsed_keep_tunneled
@@ -899,7 +957,7 @@ def main() -> int:
     print(f"  total covered addresses     : {total_covered}")
     print(f"  covered + excluded          : {total_covered + total_excluded} (2^32 = {MAX_ADDR})")
 
-    if args.max_sites is not None:
+    if max_sites_applies:
         pct = budget_extra_addresses / MAX_ADDR * 100
         print()
         print("=== Route budget (--max-sites) ===")
@@ -940,15 +998,24 @@ def main() -> int:
             )
 
     build_dir = REPO_ROOT / "build"
-    json_path = build_dir / "amnezia-sites.json"
-    txt_path = build_dir / "amnezia-sites.txt"
+    # --mode forward writes the site list (today's files, untouched by
+    # --mode exclude); --mode exclude writes the exclusion set itself into
+    # its own pair of files. Each mode only ever touches its own two files.
+    if args.mode == "exclude":
+        out_networks = collapsed_exclusions
+        json_path = build_dir / "amnezia-exclude.json"
+        txt_path = build_dir / "amnezia-exclude.txt"
+    else:
+        out_networks = sites
+        json_path = build_dir / "amnezia-sites.json"
+        txt_path = build_dir / "amnezia-sites.txt"
 
     if args.dry_run:
         print()
-        print(f"[dry-run] would write {len(sites)} entries to {json_path} and {txt_path}")
+        print(f"[dry-run] would write {len(out_networks)} entries to {json_path} and {txt_path}")
     else:
         build_dir.mkdir(parents=True, exist_ok=True)
-        entries = [{"hostname": str(net), "ips": [], "ip": ""} for net in sites]
+        entries = [{"hostname": str(net), "ips": [], "ip": ""} for net in out_networks]
         with json_path.open("w") as fh:
             fh.write("[\n")
             for i, entry in enumerate(entries):
@@ -958,11 +1025,11 @@ def main() -> int:
                 )
             fh.write("]\n")
         with txt_path.open("w") as fh:
-            for net in sites:
+            for net in out_networks:
                 fh.write(f"{net}\n")
         print()
-        print(f"Wrote {len(sites)} entries to {json_path}")
-        print(f"Wrote {len(sites)} lines to {txt_path}")
+        print(f"Wrote {len(out_networks)} entries to {json_path}")
+        print(f"Wrote {len(out_networks)} lines to {txt_path}")
 
     # --- Self-checks ---
     print()
@@ -976,35 +1043,58 @@ def main() -> int:
             ok = False
         print(f"  [{status}] {label}")
 
-    # Every keep-tunneled.txt entry must be covered by the site list --
-    # config-driven, not hardcoded: with the default config this exercises
-    # 8.8.8.8/1.1.1.1/etc, but if the user empties keep-tunneled.txt these
-    # checks simply disappear instead of failing (there is nothing left to
-    # pin, so nothing left to assert).
+    # Every check below is phrased in terms of the real-world routing outcome
+    # ("stays in the personal VPN" vs. "goes direct"), not in terms of a
+    # specific file, so the same check bodies work for both modes. `sites`
+    # and `collapsed_exclusions` are always an exact partition of all of
+    # IPv4 (that is exactly what the disjointness and address-conservation
+    # checks below verify), so "covered by the site list" and "covered by
+    # the exclusion list" are logical negations of each other. Which one
+    # actually determines real routing depends on which file this run
+    # writes: --mode forward writes the site list, so the personal VPN
+    # tunnels an address iff `sites` covers it; --mode exclude writes the
+    # exclusion list, so the personal VPN tunnels an address iff
+    # `collapsed_exclusions` does NOT cover it (MacosRouteMonitor::
+    # addExclusionRoute leaves everything not explicitly excluded on the
+    # four half-space routes into the tunnel). This is exactly why the
+    # self-checks "invert" between modes without needing separate per-mode
+    # check bodies -- only this one function's polarity against the written
+    # file changes.
+    def goes_direct(ip_str: str) -> bool:
+        """True if ip_str bypasses the personal VPN under the active --mode."""
+        if args.mode == "exclude":
+            return covered_by(ip_str, collapsed_exclusions)
+        return not covered_by(ip_str, sites)
+
+    # keep-tunneled.txt entries must stay IN the personal VPN -- config-driven,
+    # not hardcoded: with the default config this exercises 8.8.8.8/1.1.1.1/
+    # etc, but if the user empties keep-tunneled.txt these checks simply
+    # disappear instead of failing (there is nothing left to pin, so nothing
+    # left to assert).
     if parsed_keep_tunneled:
         for net in parsed_keep_tunneled:
             first, last = net.network_address, net.broadcast_address
-            covered = covered_by(str(first), sites) and covered_by(str(last), sites)
-            check(f"keep-tunneled.txt entry {net} is covered by the site list", covered)
+            stays_tunneled = not goes_direct(str(first)) and not goes_direct(str(last))
+            check(f"keep-tunneled.txt entry {net} stays in the personal VPN", stays_tunneled)
     else:
         print("  [SKIP] no keep-tunneled.txt entries configured")
 
-    # Representative private (RFC 1918) addresses must NOT be covered -- they
-    # are excluded via the special-purpose ranges above.
+    # Representative private (RFC 1918) addresses must go direct -- they are
+    # excluded via the special-purpose ranges above.
     for ip in ("10.0.0.1", "172.16.0.1", "192.168.1.1"):
-        check(f"{ip} is NOT covered by the site list", not covered_by(ip, sites))
+        check(f"{ip} goes direct (not tunneled)", goes_direct(ip))
 
-    # First address of every direct-cidrs.txt entry must NOT be covered (the
-    # entire entry is excluded, so even its first host must stay off the site
-    # list). Config-driven -- no machine-specific IP hardcoded here.
+    # First address of every direct-cidrs.txt entry must go direct (the
+    # entire entry is excluded, so even its first host must stay off the
+    # personal VPN). Config-driven -- no machine-specific IP hardcoded here.
     for net in parsed_direct_cidrs:
         first = net.network_address
-        check(f"direct-cidrs.txt first address {first} is NOT covered by the site list",
-              not covered_by(str(first), sites))
+        check(f"direct-cidrs.txt first address {first} goes direct (not tunneled)",
+              goes_direct(str(first)))
 
     # vpn-gateways.txt entries follow the active gateway-mode:
-    #   direct: every gateway must NOT be covered (excluded, like today);
-    #   tunnel: every gateway MUST be covered (kept inside the site list).
+    #   direct: every gateway must go direct (excluded, like today);
+    #   tunnel: every gateway MUST stay in the personal VPN.
     #   Exception in tunnel mode: a gateway that lies inside an always-direct
     #   direct-cidrs.txt entry is shadowed by it -- the always-direct block
     #   supersedes gateway-mode by design, so it cannot route through the
@@ -1013,8 +1103,8 @@ def main() -> int:
     for net in parsed_gateway_cidrs:
         first = net.network_address
         if args.gateway_mode == "tunnel":
-            if covered_by(str(first), sites):
-                check(f"vpn-gateways.txt first address {first} IS covered by the site list", True)
+            if not goes_direct(str(first)):
+                check(f"vpn-gateways.txt first address {first} stays in the personal VPN", True)
             else:
                 shadowing = [
                     d for d in parsed_direct_cidrs
@@ -1025,56 +1115,58 @@ def main() -> int:
                           f"direct-cidrs.txt entry {shadowing[0]} -- gateway-mode cannot override an "
                           f"always-direct block, so it stays direct by design")
                 else:
-                    check(f"vpn-gateways.txt first address {first} IS covered by the site list", False)
+                    check(f"vpn-gateways.txt first address {first} stays in the personal VPN", False)
         else:
-            check(f"vpn-gateways.txt first address {first} is NOT covered by the site list",
-                  not covered_by(str(first), sites))
+            check(f"vpn-gateways.txt first address {first} goes direct (not tunneled)",
+                  goes_direct(str(first)))
 
-    # Every resolved direct-domains.txt IP must NOT be covered. Unresolvable
+    # Every resolved direct-domains.txt IP must go direct. Unresolvable
     # placeholder domains (e.g. in config/example) only produce WARNINGs above,
     # so this check is skipped when nothing resolved.
     if resolved_direct:
         for host, ip in resolved_direct:
-            check(f"direct-domains.txt host {host} ({ip}) is NOT covered by the site list",
-                  not covered_by(ip, sites))
+            check(f"direct-domains.txt host {host} ({ip}) goes direct (not tunneled)",
+                  goes_direct(ip))
     else:
         print("  [SKIP] no direct-domains.txt hosts resolved")
 
-    # Every whole-ASN prefix added for a direct domain must be excluded too:
+    # Every whole-ASN prefix added for a direct domain must go direct too:
     # test one representative address (the prefix's network address) of every
     # added ASN prefix -- linear, not every address.
     for r in domain_records:
         for net in r["asn_prefixes"]:
             rep = str(net.network_address)
-            check(f"direct-domains.txt {r['domain']} ASN prefix {net} ({rep}) is NOT covered",
-                  not covered_by(rep, sites))
+            check(f"direct-domains.txt {r['domain']} ASN prefix {net} ({rep}) goes direct",
+                  goes_direct(rep))
 
     # corp-hosts-check.txt may resolve to public (non-RFC1918, non-direct-cidr)
     # IPs -- e.g. a corporate host hosted outside the corporate network's own
-    # netblocks. Those are excluded from the site list only via this
-    # host-resolution step, not via any CIDR range, so verifying each one is
-    # a meaningful check of that exclusion path (config-driven, no hostname
-    # hardcoded here -- see resolved_corp_hosts, built from corp-hosts-check.txt).
+    # netblocks. Those are routed direct only via this host-resolution step,
+    # not via any CIDR range, so verifying each one is a meaningful check of
+    # that exclusion path (config-driven, no hostname hardcoded here -- see
+    # resolved_corp_hosts, built from corp-hosts-check.txt).
     if resolved_corp_hosts:
         for host, ip in resolved_corp_hosts:
-            check(f"corp-hosts-check.txt host {host} ({ip}) is NOT covered by the site list",
-                  not covered_by(ip, sites))
+            check(f"corp-hosts-check.txt host {host} ({ip}) goes direct (not tunneled)",
+                  goes_direct(ip))
     else:
         print("  [SKIP] no corp-hosts-check.txt hosts resolved")
 
-    # Every DHCP nameserver and every direct-dns.txt IP must NOT be covered,
-    # so DNS traffic itself never enters the personal VPN tunnel.
+    # Every DHCP nameserver and every direct-dns.txt IP must go direct, so
+    # DNS traffic itself never enters the personal VPN tunnel.
     for ip in dhcp_ns:
-        check(f"DHCP nameserver {ip} is NOT covered by the site list",
-              not covered_by(ip, sites))
+        check(f"DHCP nameserver {ip} goes direct (not tunneled)", goes_direct(ip))
     for ip in direct_dns:
-        check(f"direct-dns.txt {ip} is NOT covered by the site list",
-              not covered_by(ip, sites))
+        check(f"direct-dns.txt {ip} goes direct (not tunneled)", goes_direct(ip))
 
     # Linear disjointness sweep: sites and collapsed exclusions merged into one
     # list sorted by start address; each network must begin after the previous
     # one ends. Linear in the combined size -- no site-vs-exclusion pairwise
     # loop (which would be quadratic with tens of thousands of exclusions).
+    # This invariant and the address-conservation check right after it are
+    # about the sites/exclusions partition itself, so they hold unchanged in
+    # both --mode forward and --mode exclude -- goes_direct() above relies on
+    # them being true.
     disjoint = True
     merged = sorted(
         sites + collapsed_exclusions,

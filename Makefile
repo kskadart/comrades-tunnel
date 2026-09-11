@@ -88,6 +88,12 @@ sites-small: ## Generate a compact site list (MAX_SITES, default 400) to speed u
 	@echo
 	@echo "Reminder: import $(ROOT)/build/amnezia-sites.json in AmneziaVPN (Split tunneling -> \"⋮\" -> \"Replace site list\") and reconnect."
 
+.PHONY: sites-exclude
+sites-exclude: ## Generate the exclusion list for AmneziaVPN "all sites except the listed ones" mode
+	@python3 "$(ROOT)/bin/gen-amnezia-sites.py" --config "$(CONFIG)" --mode exclude $(MAX_SITES_FLAG)
+	@echo
+	@echo "Reminder: import $(ROOT)/build/amnezia-exclude.json in AmneziaVPN (Split tunneling -> mode \"All sites except listed ones\" -> \"⋮\" -> \"Replace site list\") and reconnect."
+
 ##@ Verify
 .PHONY: check
 check: ## Check the actual split routing (read-only)
@@ -96,6 +102,10 @@ check: ## Check the actual split routing (read-only)
 .PHONY: check-tunnel
 check-tunnel: ## Check routing with the gateway expected inside the personal VPN
 	@sh "$(ROOT)/bin/check-split.sh" --config "$(CONFIG)" --gateway-mode tunnel
+
+.PHONY: check-exclude
+check-exclude: ## Check routing with AmneziaVPN in exclude mode
+	@sh "$(ROOT)/bin/check-split.sh" --config "$(CONFIG)" --mode exclude
 
 .PHONY: resolvers
 resolvers: ## Dry-run: what /etc/resolver files would change

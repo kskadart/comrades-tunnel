@@ -10,7 +10,19 @@
 #   - egress IP via the default route vs. forced out en0
 #   - route counts per utun interface
 #
-# Usage: check-split.sh [--config DIR] [--gateway-mode {direct,tunnel}]
+# --mode selects which AmneziaVPN split-tunneling mode is being checked
+# against (mirrors bin/gen-amnezia-sites.py --mode): 'forward' (default,
+# unchanged) expects excluded destinations to merely NOT be the personal
+# VPN's utun (the AmneziaVPN "only selected sites" mode installs no route
+# for them, so they fall through to whatever else claims them); 'exclude'
+# expects them to be routed via the physical interface (en0) specifically,
+# because in AmneziaVPN's "all sites except the listed ones" mode the client
+# installs a real kernel route for each excluded network via the physical
+# gateway (see MacosRouteMonitor::addExclusionRoute) -- and it also checks
+# that the personal VPN's utun carries only a handful of routes (the four
+# fixed half-space routes), not one per excluded network.
+#
+# Usage: check-split.sh [--config DIR] [--gateway-mode {direct,tunnel}] [--mode {forward,exclude}]
 # Exit code: 0 if every expectation PASSed, 1 otherwise.
 
 set -u
@@ -19,6 +31,7 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 CONFIG_DIR="$REPO_ROOT/local"
 GATEWAY_MODE="direct"
+MODE="forward"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -38,8 +51,16 @@ while [ $# -gt 0 ]; do
             GATEWAY_MODE=${1#--gateway-mode=}
             shift
             ;;
+        --mode)
+            MODE=$2
+            shift 2
+            ;;
+        --mode=*)
+            MODE=${1#--mode=}
+            shift
+            ;;
         *)
-            echo "Usage: $0 [--config DIR] [--gateway-mode {direct,tunnel}]" >&2
+            echo "Usage: $0 [--config DIR] [--gateway-mode {direct,tunnel}] [--mode {forward,exclude}]" >&2
             exit 2
             ;;
     esac
@@ -49,6 +70,14 @@ case "$GATEWAY_MODE" in
     direct|tunnel) ;;
     *)
         echo "ERROR: invalid --gateway-mode '$GATEWAY_MODE' (expected 'direct' or 'tunnel')" >&2
+        exit 2
+        ;;
+esac
+
+case "$MODE" in
+    forward|exclude) ;;
+    *)
+        echo "ERROR: invalid --mode '$MODE' (expected 'forward' or 'exclude')" >&2
         exit 2
         ;;
 esac
@@ -97,6 +126,9 @@ CP_UTUN=$(detect_utun_by_prefix "$CORP_TUNNEL_PREFIX")
 AMNEZIA_UTUN=$(detect_utun_by_prefix "$PERSONAL_TUNNEL_PREFIX")
 
 echo "Config dir: $CONFIG_DIR"
+if [ "$MODE" = "exclude" ]; then
+    echo "Mode: $MODE"
+fi
 echo "Corporate utun prefix (inet ${CORP_TUNNEL_PREFIX:-<unset>}): ${CP_UTUN:-<not found>}"
 echo "Personal (Amnezia) utun prefix (inet ${PERSONAL_TUNNEL_PREFIX:-<unset>}): ${AMNEZIA_UTUN:-<not found>}"
 echo
@@ -163,11 +195,18 @@ for host in $HOSTS; do
     #   - resolved IP is a vpn-gateways.txt gateway -> gateway_expected_iface
     #     (en0 in direct mode, personal utun in tunnel mode)
     #   - otherwise the IP is RFC 1918               -> corporate VPN utun
-    #   - otherwise (public corporate host)          -> NOT the personal utun
+    #   - otherwise (public corporate host)          -> in --mode forward it
+    #     is merely NOT the personal utun (no site-list route claims it, so
+    #     it falls through to whatever else does); in --mode exclude it is
+    #     specifically en0, because AmneziaVPN installs a real kernel route
+    #     for it via the physical gateway (MacosRouteMonitor::
+    #     addExclusionRoute) rather than just leaving it unclaimed.
     if is_gateway_ip "$test_ip"; then
         expected=$(gateway_expected_iface)
     elif is_rfc1918 "$test_ip"; then
         expected="${CP_UTUN:-CP_utun}"
+    elif [ "$MODE" = "exclude" ]; then
+        expected="en0"
     else
         expected="!${AMNEZIA_UTUN:-Amnezia_utun}"
     fi
@@ -240,6 +279,25 @@ echo
 echo "=== route counts per utun interface (netstat -rn -f inet) ==="
 netstat -rn -f inet 2>/dev/null | grep -oE 'utun[0-9]+' | sort | uniq -c | sort -k2 -V | \
     awk '{printf "  %-8s %s routes\n", $2, $1}'
+
+if [ "$MODE" = "exclude" ] && [ -n "$AMNEZIA_UTUN" ]; then
+    # In --mode exclude the client installs only four fixed half-space
+    # routes on the personal VPN's own utun (see MacosRouteMonitor::
+    # addExclusionRoute); every excluded destination instead gets a real
+    # kernel route via the physical gateway, so it shows up under en0 (or
+    # the corporate utun), never here. A little slack (<=10) absorbs
+    # incidental system-managed entries without weakening the point: this
+    # must stay small, unlike --mode forward's ~2,200 with the full list.
+    AMNEZIA_ROUTE_COUNT=$(netstat -rn -f inet 2>/dev/null | grep -oE 'utun[0-9]+' | grep -cE "^${AMNEZIA_UTUN}\$")
+    echo
+    if [ "$AMNEZIA_ROUTE_COUNT" -le 10 ] 2>/dev/null; then
+        echo "  [PASS] personal VPN utun ($AMNEZIA_UTUN) carries only $AMNEZIA_ROUTE_COUNT route(s) (<=10 expected: the four half-space routes plus incidental slack)"
+        count_result 0
+    else
+        echo "  [FAIL] personal VPN utun ($AMNEZIA_UTUN) carries $AMNEZIA_ROUTE_COUNT routes (>10 expected only the four half-space routes -- was the exclusion list imported into \"only selected sites\" by mistake?)"
+        count_result 1
+    fi
+fi
 
 echo
 echo "=== summary ==="
