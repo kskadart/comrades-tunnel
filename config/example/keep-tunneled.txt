@@ -1,0 +1,26 @@
+# IPs or CIDRs that MUST stay inside the personal VPN's site list, i.e. keep
+# going through the personal VPN, no matter what.
+#
+# This only matters together with --max-sites (bin/gen-amnezia-sites.py):
+# that flag shrinks the generated site list by merging the smallest gaps
+# between exclusions, and a merge only ever ADDS address space to the
+# exclusions. Without this file, nothing stops a merge from swallowing the
+# gap that carries an address you actually want tunnelled -- purely because
+# that gap happens to be small at the requested budget. Every entry listed
+# here is pinned: the merge step will never fold a gap that contains one,
+# however small that gap is. If the requested budget cannot be reached
+# because every remaining gap is protected this way, the generator prints a
+# WARNING and keeps the pins intact rather than silently exceeding the
+# budget.
+#
+# One IP address or CIDR per line; '#' starts a comment.
+#
+# Default: public DNS resolvers. The personal VPN is what carries DNS
+# traffic in this setup, so if one of these gets merged away it stops being
+# reachable through the tunnel and name resolution behaviour changes
+# (queries would go out some other way instead of through the personal VPN).
+1.1.1.1   # Cloudflare
+1.0.0.1   # Cloudflare (secondary)
+8.8.8.8   # Google
+8.8.4.4   # Google (secondary)
+9.9.9.9   # Quad9

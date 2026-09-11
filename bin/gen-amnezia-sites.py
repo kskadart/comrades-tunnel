@@ -30,6 +30,14 @@ the excluded RFC 1918 space overlap by design -- longest-prefix-match
 routing keeps corporate traffic on the corporate tunnel regardless of what
 this tool excludes from the personal VPN.
 
+`--max-sites N` shrinks the site list by greedily merging the smallest gaps
+between exclusions until it fits N networks. keep-tunneled.txt pins networks
+(public DNS resolvers by default) that this merging must never swallow: a
+gap containing a pinned network is never merged, however small it is. If
+the budget cannot be reached because every remaining gap is protected, the
+tool prints a WARNING and keeps the pins intact rather than exceeding the
+budget silently.
+
 Output (AmneziaVPN JSON import format -- see importSitesFromJson() in
 amnezia-vpn/amnezia-client, client/core/controllers/ipSplitTunnelingController.cpp):
     build/amnezia-sites.json   -- [{"hostname": "<cidr>", "ips": [], "ip": ""}, ...]
@@ -390,16 +398,25 @@ def address_exclude_all(base_networks, exclusions):
     return sites, collapsed
 
 
-def merge_gaps_to_budget(collapsed, current_site_count, max_sites):
+def merge_gaps_to_budget(collapsed, current_site_count, max_sites, pinned=None):
     """Greedily merge the smallest gaps between consecutive collapsed
     exclusions until the resulting site-network count is at most
-    `max_sites`, or no gaps remain.
+    `max_sites`, or no eligible gaps remain.
 
     A "gap" is the address range strictly between two consecutive entries
     of the already-collapsed, sorted exclusion list. Merging a gap means
     folding that range into the exclusions, so the exclusion before it,
     the gap itself, and the exclusion after it become one contiguous
     excluded range.
+
+    `pinned` is an optional list of ipaddress networks (see
+    keep-tunneled.txt) that must never be pushed out of the personal VPN.
+    Any gap whose address range intersects a pinned network is PROTECTED:
+    it is never added to the merge candidate heap, so no matter how small
+    it is it can never be merged. If every remaining gap ends up protected
+    before the budget is reached, merging simply stops -- the budget is
+    reported unmet (see `budget_met` below) rather than merging a
+    protected gap to reach it.
 
     SAFETY (preserved and must hold): merging a gap only ever ADDS the
     gap's address range to the exclusions -- it never removes or shrinks
@@ -408,7 +425,9 @@ def merge_gaps_to_budget(collapsed, current_site_count, max_sites):
     servers, RFC 1918 ranges, ...) stays excluded; merging can only push
     MORE address space out of the personal VPN, never less back in. Every
     existing self-check therefore continues to pass unchanged (verified
-    below at the call site).
+    below at the call site). Pinned networks add a second safety property:
+    they can never be part of that "more address space", because a gap
+    that contains one is never a merge candidate in the first place.
 
     Efficiency: the number of site-CIDR-blocks a gap contributes depends
     only on that gap's own start/end addresses, never on whether other
@@ -417,20 +436,31 @@ def merge_gaps_to_budget(collapsed, current_site_count, max_sites):
     (site-network count removed when merged) is computed exactly once, up
     front, and a min-heap picks the globally smallest gaps first without
     ever recomputing the full complement -- linear in the number of
-    collapsed exclusions, not quadratic.
+    collapsed exclusions, not quadratic. Checking a gap against `pinned`
+    is O(len(pinned)) per gap, which stays cheap because keep-tunneled.txt
+    is expected to hold a handful of entries, not thousands.
 
-    Returns (merged_flags, merges_performed, extra_addresses, largest_gap):
+    Returns (merged_flags, merges_performed, extra_addresses, largest_gap,
+    protected_gaps, pinned_hits, budget_met):
     merged_flags[i] is True if the gap between collapsed[i] and
     collapsed[i + 1] was merged; largest_gap is (size, start_int, end_int)
     of the biggest merged gap, or None if no merge was needed/possible.
+    protected_gaps is the number of gaps skipped because they intersect a
+    pinned network. pinned_hits maps str(pinned network) -> number of gaps
+    it protected (present with count 0 for every pinned entry that never
+    blocked anything). budget_met is False when merging ran out of
+    eligible (unprotected) gaps before the site count reached max_sites.
     """
+    pinned = pinned or []
+    pinned_hits = {str(net): 0 for net in pinned}
     n = len(collapsed)
     merged_flags = [False] * max(0, n - 1)
     merges_performed = 0
     extra_addresses = 0
     largest_gap = None
+    protected_gaps = 0
     if n < 2 or current_site_count <= max_sites:
-        return merged_flags, merges_performed, extra_addresses, largest_gap
+        return merged_flags, merges_performed, extra_addresses, largest_gap, protected_gaps, pinned_hits, True
 
     heap = []  # (gap size, gap index, start, end)
     gap_site_counts = {}  # gap index -> number of site networks it contributes
@@ -443,6 +473,15 @@ def merge_gaps_to_budget(collapsed, current_site_count, max_sites):
             # can otherwise sit immediately adjacent (zero addresses
             # between them) without being combined. There is no address
             # space to merge here, so this pair is simply not a candidate.
+            continue
+        blockers = [
+            net for net in pinned
+            if int(net.network_address) <= end and int(net.broadcast_address) >= start
+        ]
+        if blockers:
+            protected_gaps += 1
+            for net in blockers:
+                pinned_hits[str(net)] += 1
             continue
         size = end - start + 1
         gap_site_counts[i] = sum(
@@ -463,7 +502,8 @@ def merge_gaps_to_budget(collapsed, current_site_count, max_sites):
         if largest_gap is None or size > largest_gap[0]:
             largest_gap = (size, start, end)
 
-    return merged_flags, merges_performed, extra_addresses, largest_gap
+    budget_met = total_sites <= max_sites
+    return merged_flags, merges_performed, extra_addresses, largest_gap, protected_gaps, pinned_hits, budget_met
 
 
 def apply_gap_merges(collapsed, merged_flags):
@@ -553,7 +593,10 @@ def main() -> int:
              "gaps between exclusions until it fits (default: unlimited, i.e. "
              "today's behaviour). Merging only ever ADDS address space to the "
              "exclusions, so it can only shrink the personal VPN's coverage, "
-             "never weaken what must stay off it.",
+             "never weaken what must stay off it. Networks pinned in "
+             "keep-tunneled.txt are never merged away; if the budget cannot "
+             "be reached because of that, a WARNING is printed instead of "
+             "exceeding the budget.",
     )
     args = parser.parse_args()
     if args.max_sites is not None and args.max_sites <= 0:
@@ -610,6 +653,23 @@ def main() -> int:
             exclusions.add(net)
         parsed_gateway_cidrs.append(net)
         n_gateway_cidrs += 1
+
+    # --- keep-tunneled.txt: networks pinned to stay inside the personal VPN -
+    # These are never added to `exclusions` -- they are ordinary addresses
+    # that the rest of this script's logic already leaves uncovered (public
+    # DNS resolvers, by default). Their only special treatment is in
+    # merge_gaps_to_budget(): a gap that contains one of them is never a
+    # merge candidate, however small, so --max-sites can never trade them
+    # away. See the self-checks below for the coverage verification.
+    keep_tunneled_raw = read_list(config_dir / "keep-tunneled.txt")
+    parsed_keep_tunneled = []  # valid networks parsed from keep-tunneled.txt
+    for entry in keep_tunneled_raw:
+        try:
+            net = ipaddress.ip_network(entry, strict=False)
+        except ValueError as exc:
+            print(f"WARNING: skipping invalid entry '{entry}' in keep-tunneled.txt: {exc}")
+            continue
+        parsed_keep_tunneled.append(net)
 
     # --- Whole-ASN expansion of direct-domains.txt -------------------------
     # Load the RIPE NCC country file (cached 7 days) unless expansion is off.
@@ -788,9 +848,13 @@ def main() -> int:
     # precomputed per-gap costs avoids recomputing the full complement.
     budget_merges = budget_extra_addresses = 0
     budget_largest_gap = None
+    budget_protected_gaps = 0
+    budget_pinned_hits = {str(net): 0 for net in parsed_keep_tunneled}
+    budget_met = True
     if args.max_sites is not None:
-        merged_flags, budget_merges, budget_extra_addresses, budget_largest_gap = (
-            merge_gaps_to_budget(collapsed_exclusions, len(sites), args.max_sites)
+        (merged_flags, budget_merges, budget_extra_addresses, budget_largest_gap,
+         budget_protected_gaps, budget_pinned_hits, budget_met) = merge_gaps_to_budget(
+            collapsed_exclusions, len(sites), args.max_sites, parsed_keep_tunneled
         )
         if budget_merges:
             collapsed_exclusions, sites = apply_gap_merges(collapsed_exclusions, merged_flags)
@@ -824,6 +888,9 @@ def main() -> int:
         print(f"      {host} -> {ip}")
     print(f"  DHCP nameservers ({default_interface()}): {len(dhcp_ns)} -> {dhcp_ns}")
     print(f"  direct-dns.txt                : {len(direct_dns)} -> {direct_dns}")
+    print(f"  keep-tunneled.txt entries   : {len(parsed_keep_tunneled)} -> "
+          f"{', '.join(str(n) for n in parsed_keep_tunneled) if parsed_keep_tunneled else '-'}")
+    print(f"  gaps protected by pins      : {budget_protected_gaps}")
     print(f"  collapsed exclusion networks: {len(collapsed_exclusions)}")
     print(f"  total excluded addresses    : {total_excluded}")
     print()
@@ -840,6 +907,7 @@ def main() -> int:
         print(f"  gap merges performed        : {budget_merges}")
         print(f"  resulting site networks     : {len(sites)}")
         print(f"  extra addresses excluded    : {budget_extra_addresses} ({pct:.4f}% of all IPv4)")
+        print(f"  gaps protected by pins      : {budget_protected_gaps}")
         if budget_largest_gap:
             size, start, end = budget_largest_gap
             print(
@@ -848,6 +916,28 @@ def main() -> int:
             )
         else:
             print("  largest merged gap          : none (no merge was needed/possible)")
+
+        if not budget_met:
+            # The heap ran out of eligible (unprotected) gaps before the site
+            # count reached the budget. This is a legitimate outcome, not an
+            # error: keep-tunneled.txt pins are respected instead of being
+            # silently traded away to hit an unreachable number.
+            top_blockers = sorted(
+                (item for item in budget_pinned_hits.items() if item[1] > 0),
+                key=lambda kv: kv[1], reverse=True,
+            )
+            blockers_desc = (
+                ", ".join(f"{net} ({count} gap(s))" for net, count in top_blockers)
+                if top_blockers else "none"
+            )
+            print()
+            print(
+                f"WARNING: --max-sites {args.max_sites} could not be met: every remaining "
+                f"gap small enough to merge is protected by keep-tunneled.txt. The site list "
+                f"has {len(sites)} network(s) instead of the requested {args.max_sites}; "
+                f"{budget_protected_gaps} gap(s) were protected. Pinned entries blocking the "
+                f"most merges: {blockers_desc}."
+            )
 
     build_dir = REPO_ROOT / "build"
     json_path = build_dir / "amnezia-sites.json"
@@ -886,8 +976,18 @@ def main() -> int:
             ok = False
         print(f"  [{status}] {label}")
 
-    check("8.8.8.8 is covered by the site list", covered_by("8.8.8.8", sites))
-    check("1.1.1.1 is covered by the site list", covered_by("1.1.1.1", sites))
+    # Every keep-tunneled.txt entry must be covered by the site list --
+    # config-driven, not hardcoded: with the default config this exercises
+    # 8.8.8.8/1.1.1.1/etc, but if the user empties keep-tunneled.txt these
+    # checks simply disappear instead of failing (there is nothing left to
+    # pin, so nothing left to assert).
+    if parsed_keep_tunneled:
+        for net in parsed_keep_tunneled:
+            first, last = net.network_address, net.broadcast_address
+            covered = covered_by(str(first), sites) and covered_by(str(last), sites)
+            check(f"keep-tunneled.txt entry {net} is covered by the site list", covered)
+    else:
+        print("  [SKIP] no keep-tunneled.txt entries configured")
 
     # Representative private (RFC 1918) addresses must NOT be covered -- they
     # are excluded via the special-purpose ranges above.
