@@ -20,6 +20,16 @@ CONFIG ?= local
 MAX_SITES ?=
 MAX_SITES_FLAG = $(if $(MAX_SITES),--max-sites $(MAX_SITES),)
 
+# Minutes to suspend the installed route-lift watcher for: make route-lift-pause
+# MINUTES=90. Default 60, capped by the watcher itself at 480 (8h).
+MINUTES ?= 60
+
+# Path route-lift-pause/route-lift-resume operate on: the INSTALLED copy of
+# the watcher (not bin/route-lift-watcher.sh), because only that copy has
+# the co-located route-lift.conf that resolves the real, running daemon's
+# STATE_DIR -- see bin/route-lift-watcher.sh's --config header comment.
+ROUTE_LIFT_INSTALLED := /Library/Application Support/comrades-tunnel/route-lift-watcher.sh
+
 .DEFAULT_GOAL := help
 
 .PHONY: help
@@ -150,6 +160,16 @@ route-lift-install: ## Install and load the route-lift watcher LaunchDaemon (sud
 route-lift-uninstall: ## Stop and remove the route-lift watcher LaunchDaemon (sudo)
 	@echo "WARNING: will stop and remove the route-lift watcher LaunchDaemon and installed files under sudo."
 	@sudo sh "$(ROOT)/bin/install-route-lift-watcher.sh" --config "$(CONFIG)" --uninstall
+
+.PHONY: route-lift-pause
+route-lift-pause: ## Pause the watcher for MINUTES (default 60) while a long-running job needs the tunnel undisturbed
+	@echo "WARNING: writes to the installed watcher's root-owned state dir; requires sudo."
+	@sudo sh "$(ROUTE_LIFT_INSTALLED)" --pause $(MINUTES)
+
+.PHONY: route-lift-resume
+route-lift-resume: ## Resume the installed watcher after a pause (sudo)
+	@echo "WARNING: writes to the installed watcher's root-owned state dir; requires sudo."
+	@sudo sh "$(ROUTE_LIFT_INSTALLED)" --resume
 
 .PHONY: dns-reset
 dns-reset: ## Reset the primary service's DNS back to DHCP (sudo)

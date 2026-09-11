@@ -20,6 +20,16 @@
 #                            on any failed `route add`
 #   RESTORE_VERIFY_FAILED   initialise to 0; set to 1 by verify_restore on a
 #                            post-restore route-count mismatch
+#   KEEP_ROUTES_FILE        path to the keep-routes-for.txt config (see
+#                            config/example/keep-routes-for.txt); may not
+#                            exist -- that means the feature is unused
+#   KEEP_ROUTES_SCRIPT      path to keep-routes.py, which does the actual
+#                            DNS resolution and CIDR containment check for
+#                            compute_keep_set() below
+#   KEPT_ROUTES_FILE        path compute_keep_set() writes its result to
+#                            (truncated first on every call); read back by
+#                            verify_restore() to size-check the restore
+#                            correctly when some routes were never deleted
 #
 # The data file itself is read back with `read` and passed to `route` as
 # literal, quoted arguments only -- never sourced or eval'd, same discipline
@@ -140,6 +150,14 @@ delete_amnezia_routes() {
         while read -r dest; do
             [ "$dest" = "default" ] && continue   # never touch the default route
             ndest=$(normalize_dest "$dest")
+            # A dry-run keep-set preview (see compute_keep_set) writes here
+            # for real before this runs -- skip anything it decided to
+            # keep, so the preview does not claim it "would delete" a route
+            # that a live run would actually leave alone.
+            if [ -n "${KEPT_ROUTES_FILE:-}" ] && [ -f "$KEPT_ROUTES_FILE" ] &&
+               awk -v d="$ndest" '$1==d{f=1} END{exit !f}' "$KEPT_ROUTES_FILE"; then
+                continue
+            fi
             echo "  would run: sudo route -n -q delete -net \"$ndest\""
         done
         return 0
@@ -244,10 +262,22 @@ restore_saved_routes() {
 # both numbers) and marks the run failed on a mismatch; separately reports
 # the personal-VPN utun being altogether absent, since that is not a
 # route-count problem and would only confuse if reported as one.
+#
+# Routes named in KEPT_ROUTES_FILE (see compute_keep_set) were never
+# deleted in the first place, so they are still on the interface the whole
+# time -- the expected post-restore count is saved+kept, not just saved.
+# KEPT_ROUTES_FILE is optional (unset or absent means kept=0, i.e. the
+# exact pre-keep-routes behaviour) so this is a no-op for any caller not
+# using that feature.
 verify_restore() {
     [ "$DRY_RUN" = 1 ] && return 0
     [ ! -f "$SAVED_ROUTES_FILE" ] && return 0   # nothing was saved this run
     saved_count=$(wc -l <"$SAVED_ROUTES_FILE" | tr -d ' ')
+    kept_count=0
+    if [ -n "${KEPT_ROUTES_FILE:-}" ] && [ -f "$KEPT_ROUTES_FILE" ]; then
+        kept_count=$(wc -l <"$KEPT_ROUTES_FILE" | tr -d ' ')
+    fi
+    expected_count=$((saved_count + kept_count))
     utun_now=$(detect_utun_by_prefix "$PERSONAL_TUNNEL_PREFIX")
     if [ -z "$utun_now" ]; then
         echo
@@ -259,14 +289,80 @@ verify_restore() {
         return 1
     fi
     now_count=$(routes_on_iface "$utun_now")
-    if [ "$now_count" != "$saved_count" ]; then
+    if [ "$now_count" != "$expected_count" ]; then
         echo
-        echo "ERROR: route count mismatch after restore: saved $saved_count, now $now_count routes point at $utun_now." >&2
+        echo "ERROR: route count mismatch after restore: expected $expected_count ($saved_count restored + $kept_count kept), now $now_count routes point at $utun_now." >&2
         echo "Saved routes are in $SAVED_ROUTES_FILE -- to restore by hand:" >&2
         manual_restore_hint >&2
         RESTORE_VERIFY_FAILED=1
         return 1
     fi
-    echo "Verified: $now_count/$saved_count routes are back on $utun_now."
+    echo "Verified: $now_count/$expected_count routes are back on $utun_now ($saved_count restored + $kept_count kept)."
+    return 0
+}
+
+# compute_keep_set ROUTES_FILE -- given ROUTES_FILE already containing
+# normalised "dest gateway" pairs for the personal VPN's utun (as written
+# by save_amnezia_routes, or a throwaway preview file for a --dry-run),
+# determine which of those routes must survive a lift per KEEP_ROUTES_FILE
+# (see config/example/keep-routes-for.txt) using KEEP_ROUTES_SCRIPT
+# (bin/keep-routes.py -- POSIX sh has no sane way to do DNS resolution plus
+# CIDR containment). On success (0): ROUTES_FILE is rewritten in place with
+# the kept lines removed, so callers can go on to save/delete/preview
+# exactly as before, just on a smaller set; KEPT_ROUTES_FILE (truncated
+# first) ends up holding one "dest gateway entry detail" line per kept
+# route, empty if the feature is unused or nothing matched.
+#
+# Returns 1 -- and leaves ROUTES_FILE untouched -- only when
+# KEEP_ROUTES_FILE has active entries but none of them could be resolved
+# or parsed at all (no python3, or every single lookup failed). The caller
+# MUST then treat this exactly like any other "cannot verify it's safe to
+# proceed" case and lift nothing this cycle: proceeding without a keep-set
+# would silently delete the very routes this feature exists to protect. A
+# domain that individually fails to resolve while others succeed is only a
+# warning (printed to stderr by keep-routes.py) and does not reach this
+# path -- see that script's own compute() for the exact rule.
+compute_keep_set() {
+    routes_file=$1
+    : >"$KEPT_ROUTES_FILE"
+
+    active_entries=0
+    if [ -n "${KEEP_ROUTES_FILE:-}" ] && [ -f "$KEEP_ROUTES_FILE" ]; then
+        active_entries=$(grep -v -E '^[[:space:]]*(#|$)' "$KEEP_ROUTES_FILE" 2>/dev/null | grep -c .)
+        [ -z "$active_entries" ] && active_entries=0
+    fi
+    if [ "$active_entries" -eq 0 ] 2>/dev/null; then
+        return 0   # feature unused (missing/empty file) -- empty keep-set, not a failure
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "FATAL: $KEEP_ROUTES_FILE has $active_entries active entries but python3 is not available to compute the keep-set." >&2
+        return 1
+    fi
+
+    kept_out=$(mktemp) || { echo "FATAL: could not create a temp file to compute the keep-set" >&2; return 1; }
+    err_out=$(mktemp) || { rm -f "$kept_out"; echo "FATAL: could not create a temp file to compute the keep-set" >&2; return 1; }
+    python3 "$KEEP_ROUTES_SCRIPT" compute "$KEEP_ROUTES_FILE" "$routes_file" >"$kept_out" 2>"$err_out"
+    rc=$?
+    if [ -s "$err_out" ]; then
+        while IFS= read -r eline; do echo "$eline" >&2; done <"$err_out"
+    fi
+    rm -f "$err_out"
+    if [ "$rc" -ne 0 ]; then
+        rm -f "$kept_out"
+        return 1
+    fi
+    mv "$kept_out" "$KEPT_ROUTES_FILE"
+
+    if [ -s "$KEPT_ROUTES_FILE" ]; then
+        tmp_filtered=$(mktemp) || { echo "FATAL: could not create a temp file to filter kept routes" >&2; return 1; }
+        # NR==FNR reads KEPT_ROUTES_FILE (col 1 = dest, tab-separated) into
+        # "kept"; the second pass over routes_file (col 1 = dest,
+        # space-separated) drops any line whose destination is in that set.
+        # awk's default field splitter treats runs of tabs/spaces alike, so
+        # $1 is correct either way without setting FS explicitly.
+        awk 'NR==FNR{kept[$1]=1; next} !($1 in kept)' "$KEPT_ROUTES_FILE" "$routes_file" >"$tmp_filtered"
+        mv "$tmp_filtered" "$routes_file"
+    fi
     return 0
 }

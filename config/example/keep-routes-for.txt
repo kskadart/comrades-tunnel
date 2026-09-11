@@ -1,0 +1,27 @@
+# Domains or literal CIDR/IP entries whose routes on the personal VPN's
+# utun must survive bin/route-lift-watcher.sh / bin/cp-connect.sh --method
+# routes lifting the rest. One entry per line; '#' starts a comment; blank
+# lines are ignored. A domain is resolved to its current IPv4 addresses at
+# lift time -- the personal VPN's routes are still up then, so resolution
+# goes through the tunnel exactly as the real traffic would. A literal
+# a.b.c.d/len (or a bare a.b.c.d, taken as /32) is used as-is, no DNS
+# involved.
+#
+# Why keep anything at all: an already-open, long-lived connection through
+# one of these routes (e.g. a streaming LLM API response) would otherwise
+# stall for the whole lift window -- see the README section "Что
+# происходит с уже открытыми соединениями". Deleting ~2,200 routes but
+# keeping a handful makes no measurable difference to Check Point's
+# route-conflict scan, so this removes the disruption entirely for
+# whatever is listed here, instead of merely shortening it.
+#
+# Fail-safe: if this file has active entries but none of them resolve or
+# parse at all, the lift is skipped entirely that cycle rather than risk
+# deleting a route this file was meant to protect -- see
+# bin/keep-routes.py and the README.
+api.anthropic.com
+api.openai.com
+generativelanguage.googleapis.com
+api.mistral.ai
+openrouter.ai
+# 1.2.3.0/24   -- example of a literal CIDR entry instead of a domain

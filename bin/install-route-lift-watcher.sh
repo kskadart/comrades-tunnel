@@ -20,9 +20,15 @@
 #       (copy of bin/route-lift-watcher.sh)
 #   /Library/Application Support/comrades-tunnel/lib-routes.sh
 #       (copy of bin/lib-routes.sh, sourced by the copy above)
+#   /Library/Application Support/comrades-tunnel/keep-routes.py
+#       (copy of bin/keep-routes.py, invoked by lib-routes.sh's
+#       compute_keep_set -- see that function and README)
+#   /Library/Application Support/comrades-tunnel/keep-routes-for.txt
+#       (copy of DIR/keep-routes-for.txt, if present -- optional; its
+#       absence just means the keep-routes feature is unused)
 #   /Library/Application Support/comrades-tunnel/route-lift.conf
-#       (KEY=VALUE, PERSONAL_TUNNEL_PREFIX from DIR/tunnels.txt plus fixed
-#       TIMEOUT/HELPDESK_LOG/STATE_DIR)
+#       (KEY=VALUE, PERSONAL_TUNNEL_PREFIX and LIFT_TRIGGER from
+#       DIR/tunnels.txt plus fixed TIMEOUT/HELPDESK_LOG/STATE_DIR)
 #   /Library/LaunchDaemons/dev.comrades-tunnel.route-lift.plist
 #       (WatchPaths on helpdesk.log, StartInterval for the safety net,
 #       RunAtLoad false)
@@ -77,6 +83,10 @@ WATCHER_SRC="$SCRIPT_DIR/route-lift-watcher.sh"
 WATCHER_DST="$LIB_DIR/route-lift-watcher.sh"
 LIBROUTES_SRC="$SCRIPT_DIR/lib-routes.sh"
 LIBROUTES_DST="$LIB_DIR/lib-routes.sh"
+KEEPROUTES_SRC="$SCRIPT_DIR/keep-routes.py"
+KEEPROUTES_DST="$LIB_DIR/keep-routes.py"
+KEEPFILE_SRC=""   # set once CONFIG_DIR is known, below
+KEEPFILE_DST="$LIB_DIR/keep-routes-for.txt"
 CONF_DST="$LIB_DIR/route-lift.conf"
 PLIST_LABEL="dev.comrades-tunnel.route-lift"
 PLIST_DST="/Library/LaunchDaemons/$PLIST_LABEL.plist"
@@ -120,7 +130,7 @@ assert_safe_path() {
 if [ "$ACTION" = "uninstall" ]; then
     echo "Uninstalling $PLIST_LABEL"
     sudo launchctl bootout "system/$PLIST_LABEL" 2>/dev/null || true
-    for f in "$PLIST_DST" "$WATCHER_DST" "$LIBROUTES_DST" "$CONF_DST"; do
+    for f in "$PLIST_DST" "$WATCHER_DST" "$LIBROUTES_DST" "$KEEPROUTES_DST" "$KEEPFILE_DST" "$CONF_DST"; do
         if [ -e "$f" ]; then
             sudo rm -f "$f"
             echo "Removed: $f"
@@ -145,12 +155,17 @@ if [ ! -f "$LIBROUTES_SRC" ]; then
     echo "ERROR: $LIBROUTES_SRC not found" >&2
     exit 1
 fi
+if [ ! -f "$KEEPROUTES_SRC" ]; then
+    echo "ERROR: $KEEPROUTES_SRC not found" >&2
+    exit 1
+fi
 
 TUNNELS_FILE="$CONFIG_DIR/tunnels.txt"
 if [ ! -f "$TUNNELS_FILE" ]; then
     echo "ERROR: $TUNNELS_FILE not found (see config/example/tunnels.txt)" >&2
     exit 1
 fi
+KEEPFILE_SRC="$CONFIG_DIR/keep-routes-for.txt"
 
 # Reuse get_tunnel_prefix from lib-routes.sh instead of re-implementing the
 # same grep/cut parsing here.
@@ -160,6 +175,15 @@ if [ -z "$PERSONAL_TUNNEL_PREFIX" ]; then
     echo "ERROR: PERSONAL_TUNNEL_PREFIX not set in $TUNNELS_FILE" >&2
     exit 1
 fi
+LIFT_TRIGGER=$(get_tunnel_prefix LIFT_TRIGGER)
+case "$LIFT_TRIGGER" in
+    connect-start|pre-scan) ;;
+    '') LIFT_TRIGGER=connect-start ;;
+    *)
+        echo "ERROR: invalid LIFT_TRIGGER '$LIFT_TRIGGER' in $TUNNELS_FILE (expected connect-start or pre-scan)" >&2
+        exit 1
+        ;;
+esac
 
 echo "Checking path safety:"
 assert_safe_path "$LIB_DIR"
@@ -172,6 +196,7 @@ trap 'rm -f "$TMP_CONF" "$TMP_PLIST"' EXIT
 
 cat >"$TMP_CONF" <<EOF
 PERSONAL_TUNNEL_PREFIX=$PERSONAL_TUNNEL_PREFIX
+LIFT_TRIGGER=$LIFT_TRIGGER
 TIMEOUT=$TIMEOUT
 HELPDESK_LOG=$HELPDESK_LOG
 STATE_DIR=$STATE_DIR
@@ -268,6 +293,34 @@ else
 fi
 echo
 
+echo "=== $KEEPROUTES_DST ==="
+if [ -f "$KEEPROUTES_DST" ]; then
+    if diff -u "$KEEPROUTES_DST" "$KEEPROUTES_SRC"; then
+        echo "--- diff against installed file: none (up to date) ---"
+    else
+        echo "--- diff against installed file above ($KEEPROUTES_DST -> $KEEPROUTES_SRC) ---"
+    fi
+else
+    echo "--- installed file: none, would create $KEEPROUTES_DST (copy of $KEEPROUTES_SRC) ---"
+fi
+echo
+
+echo "=== $KEEPFILE_DST ==="
+if [ -f "$KEEPFILE_SRC" ]; then
+    if [ -f "$KEEPFILE_DST" ]; then
+        if diff -u "$KEEPFILE_DST" "$KEEPFILE_SRC"; then
+            echo "--- diff against installed file: none (up to date) ---"
+        else
+            echo "--- diff against installed file above ($KEEPFILE_DST -> $KEEPFILE_SRC) ---"
+        fi
+    else
+        echo "--- installed file: none, would create $KEEPFILE_DST (copy of $KEEPFILE_SRC) ---"
+    fi
+else
+    echo "--- $KEEPFILE_SRC not found; the keep-routes feature will be inactive (no routes protected during a lift) ---"
+fi
+echo
+
 if [ "$ACTION" = "dry-run" ]; then
     echo "dry-run: no changes made. Re-run with --apply (sudo) to install."
     exit 0
@@ -279,13 +332,21 @@ fi
 sudo mkdir -p "$LIB_DIR" "$STATE_DIR"
 sudo cp "$WATCHER_SRC" "$WATCHER_DST"
 sudo cp "$LIBROUTES_SRC" "$LIBROUTES_DST"
+sudo cp "$KEEPROUTES_SRC" "$KEEPROUTES_DST"
 sudo cp "$TMP_CONF" "$CONF_DST"
 sudo cp "$TMP_PLIST" "$PLIST_DST"
+if [ -f "$KEEPFILE_SRC" ]; then
+    sudo cp "$KEEPFILE_SRC" "$KEEPFILE_DST"
+fi
 
-sudo chown root:wheel "$WATCHER_DST" "$LIBROUTES_DST" "$CONF_DST" "$PLIST_DST" "$STATE_DIR"
-sudo chmod 755 "$WATCHER_DST" "$LIBROUTES_DST"
+sudo chown root:wheel "$WATCHER_DST" "$LIBROUTES_DST" "$KEEPROUTES_DST" "$CONF_DST" "$PLIST_DST" "$STATE_DIR"
+sudo chmod 755 "$WATCHER_DST" "$LIBROUTES_DST" "$KEEPROUTES_DST"
 sudo chmod 644 "$CONF_DST" "$PLIST_DST"
 sudo chmod 755 "$STATE_DIR"
+if [ -f "$KEEPFILE_DST" ]; then
+    sudo chown root:wheel "$KEEPFILE_DST"
+    sudo chmod 644 "$KEEPFILE_DST"
+fi
 
 sudo launchctl bootout "system/$PLIST_LABEL" 2>/dev/null || true
 sudo launchctl bootstrap system "$PLIST_DST"

@@ -58,6 +58,19 @@
 # bare form is genuinely ambiguous. `--self-test` exercises that
 # normalisation against a fixed table of inputs/outputs.
 #
+# --method routes also excludes, from both the save and the delete step,
+# any route to an endpoint listed in config/example/keep-routes-for.txt
+# (see that file and lib-routes.sh's compute_keep_set) -- e.g. a streaming
+# LLM API reachable only through the personal VPN, so an already-open
+# connection to it is never disrupted by a lift at all, not merely for a
+# shorter window. If that keep-set cannot be computed (no python3, or
+# every configured entry fails to resolve), this method refuses to delete
+# anything rather than risk the very routes it was meant to protect --
+# --dry-run resolves the same keep-set for real (read-only) to preview it.
+# --method prompt cannot benefit from this at all: it disconnects the
+# whole personal VPN, so every route -- kept or not -- goes away with the
+# interface (see README).
+#
 # The corporate-VPN wait does not rely on CORP_TUNNEL_PREFIX alone: Check
 # Point assigns its Office Mode address dynamically (the third octet has
 # been observed to change every session), so any utun that gains an inet
@@ -218,6 +231,14 @@ BUILD_DIR="$REPO_ROOT/build"
 SAVED_ROUTES_FILE="$BUILD_DIR/cp-connect-saved-routes.txt"
 AMNEZIA_SERVICE_LABEL="AmneziaVPN-service"
 AMNEZIA_PLIST="/Library/LaunchDaemons/AmneziaVPN.plist"
+
+# KEEP_ROUTES_FILE/KEEP_ROUTES_SCRIPT/KEPT_ROUTES_FILE: see lib-routes.sh's
+# compute_keep_set() header. Shared with route-lift-watcher.sh so a
+# configured endpoint (config/example/keep-routes-for.txt) survives a
+# --method routes lift the same way it survives an automatic one.
+KEEP_ROUTES_FILE="$CONFIG_DIR/keep-routes-for.txt"
+KEEP_ROUTES_SCRIPT="$SCRIPT_DIR/keep-routes.py"
+KEPT_ROUTES_FILE="$BUILD_DIR/cp-connect-kept-routes.txt"
 
 # --- utun / route inspection (read-only, always safe to run for real) ---
 #
@@ -538,14 +559,52 @@ case "$METHOD" in
             exit 1
         fi
         echo "About to save routes for $AMNEZIA_UTUN_START to $SAVED_ROUTES_FILE, then delete them."
+        ROUTES_SKIP_DELETE=0
         if [ "$DRY_RUN" = 1 ]; then
             echo "  would run: mkdir -p $BUILD_DIR"
             echo "  would run: netstat -rn -f inet | awk '\$NF==\"$AMNEZIA_UTUN_START\" {print \$1, \$2}' > $SAVED_ROUTES_FILE"
+            # Keep-routes preview: resolves KEEP_ROUTES_FILE for real
+            # (read-only) against a throwaway file instead of the real
+            # SAVED_ROUTES_FILE, so nothing is actually saved/deleted here.
+            kr_preview_file=$(mktemp)
+            netstat -rn -f inet 2>/dev/null | awk -v i="$AMNEZIA_UTUN_START" '$NF==i {print $1, $2}' |
+            while read -r dest gw; do
+                [ -z "$dest" ] && continue
+                echo "$(normalize_dest "$dest") $gw"
+            done >"$kr_preview_file"
+            echo "  (dry-run: resolving $KEEP_ROUTES_FILE for real to preview the keep-set -- nothing will be saved/deleted)"
+            if compute_keep_set "$kr_preview_file"; then
+                if [ -s "$KEPT_ROUTES_FILE" ]; then
+                    echo "  would keep $(wc -l <"$KEPT_ROUTES_FILE" | tr -d ' ') route(s):"
+                    while IFS= read -r kline; do echo "    kept: $kline"; done <"$KEPT_ROUTES_FILE"
+                else
+                    echo "  would keep 0 routes (no active entries in $KEEP_ROUTES_FILE, or none matched)"
+                fi
+            else
+                echo "  NOTE: keep-set could not be computed (see above) -- a live run would refuse to delete anything and leave the corporate connect slow."
+            fi
+            rm -f "$kr_preview_file"
+            # KEPT_ROUTES_FILE is left as compute_keep_set wrote it above so
+            # delete_amnezia_routes's own dry-run preview (below) excludes
+            # the same kept routes; cleaned up once that preview is done.
         else
             save_amnezia_routes "$AMNEZIA_UTUN_START"
             echo "Saved $(wc -l <"$SAVED_ROUTES_FILE" | tr -d ' ') routes to $SAVED_ROUTES_FILE."
+            if compute_keep_set "$SAVED_ROUTES_FILE"; then
+                if [ -s "$KEPT_ROUTES_FILE" ]; then
+                    echo "Keeping $(wc -l <"$KEPT_ROUTES_FILE" | tr -d ' ') route(s) per $KEEP_ROUTES_FILE:"
+                    while IFS= read -r kline; do echo "  kept: $kline"; done <"$KEPT_ROUTES_FILE"
+                fi
+            else
+                echo "ERROR: keep-set could not be computed from $KEEP_ROUTES_FILE (see above); NOT deleting any routes -- the corporate VPN connect will be slow this run." >&2
+                rm -f "$SAVED_ROUTES_FILE" "$KEPT_ROUTES_FILE"
+                ROUTES_SKIP_DELETE=1
+            fi
         fi
-        delete_amnezia_routes "$AMNEZIA_UTUN_START"
+        if [ "$ROUTES_SKIP_DELETE" = 0 ]; then
+            delete_amnezia_routes "$AMNEZIA_UTUN_START"
+        fi
+        [ "$DRY_RUN" = 1 ] && rm -f "$KEPT_ROUTES_FILE"
         ;;
     launchd)
         launchd_down

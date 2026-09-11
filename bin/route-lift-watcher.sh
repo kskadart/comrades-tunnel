@@ -24,10 +24,59 @@
 # below, which is exactly the decision logic --self-test exercises. The log
 # file is root:wheel, world-readable -- no privilege is needed to read it.
 #
+# Trigger mode (LIFT_TRIGGER / --trigger): "connect-start" (default) fires
+# on the connect-start line itself, as described above -- reliable, but
+# keeps routes lifted for the ~15-35s Check Point spends on ClientHello,
+# topology download, and the firewall-policy step before the expensive
+# route-conflict scan even begins (see README's measured timeline).
+# "pre-scan" instead waits for the last marker before that scan, "no need
+# executing firewall step" in the same helpdesk.log, and only counts it if
+# a connect-start was seen earlier with no completion since -- so an
+# isolated, unrelated occurrence of that line can never fire it. This
+# shrinks the disruption window to roughly the scan's own duration, but is
+# a tighter race: if this watcher is slow to react, Check Point may start
+# the scan before routes are actually lifted, and the connect is then just
+# as slow as if this watcher did not exist (a missed optimisation, not a
+# breakage -- see README). decide_state() below tracks a third, transient
+# CONNECTING state for "pre-scan" between the two markers; --self-test
+# exercises both modes.
+#
 # Route save/normalise/delete/restore/verify logic is shared with
 # cp-connect.sh via lib-routes.sh (see that file's header for the exact
 # global-variable contract); this script sets the same globals cp-connect.sh
-# does before calling into it.
+# does before calling into it. It also shares that file's compute_keep_set,
+# which excludes routes to configured LLM-API-style endpoints
+# (config/example/keep-routes-for.txt) from both the save and the delete
+# step, so an already-open connection to one of them is never disrupted by
+# a lift at all -- see that file and the README for why, and the fail-safe
+# rule if the keep-set cannot be computed.
+#
+# Every completed cycle logs how long the routes were actually gone
+# (seconds from when they were saved -- immediately before deletion began
+# -- to when the restore was verified, via the saved-routes file's own
+# mtime and age_seconds()); the same figure for the most recent cycle is
+# persisted under STATE_DIR and shown by --status, since that is the
+# number that determines whether a long-lived streaming connection through
+# the personal VPN survived the stall (see README).
+#
+# Pause switch (--pause [MINUTES] / --resume): for a long-running job not
+# covered by the keep-routes list above, a human can suppress the normal
+# lift decision for a bounded time. This is a plain file, PAUSE_FILE,
+# holding an absolute expiry (epoch seconds); pause_state() below reads it
+# and never writes it, so a missing/corrupt/expired file always reads as
+# "not paused" -- there is no code path that can manufacture an indefinite
+# pause. --pause with no MINUTES defaults to 60, capped at 480 (8h); the
+# expiry is always printed by --pause and by --status. A pause only
+# suppresses run_decision_cycle's own lift/restore ACTION (see the top of
+# that check inside the function) -- it still advances the offset/state
+# files every cycle, specifically so that once the pause expires this
+# resumes from "now" instead of folding a whole pause window's backlog
+# into one slice (a burst of catch-up decisions); and it never touches
+# run_safety_net_check, which restores any already-lifted routes
+# regardless of a pause (see that function's own comment) -- leaving the
+# personal VPN's routes lifted is never acceptable, paused or not. While
+# paused, an automatic corporate-VPN reconnect is simply not sped up: it
+# is just as slow as if this watcher were not installed.
 #
 # Safety design (see README for the one-paragraph version):
 #   - Never delete a route this script has not first verified it saved: the
@@ -44,9 +93,10 @@
 #     normal invocation path -- see run_safety_net_check) restores
 #     unconditionally and logs loudly if a saved-routes file is older than
 #     the timeout and the personal VPN's utun currently has fewer routes
-#     than were saved -- this is what self-heals a crash between delete and
-#     restore, independent of the trap above (which only fires for the
-#     process that actually did the deleting).
+#     than were saved (plus kept) -- this is what self-heals a crash
+#     between delete and restore, independent of the trap above (which
+#     only fires for the process that actually did the deleting), and
+#     independent of a pause (see above).
 #   - Unlike cp-connect.sh (a one-shot interactive script, where the saved-
 #     routes file is left on disk after a restore as a historical record),
 #     this watcher runs unattended and repeatedly, so it treats the saved-
@@ -61,11 +111,14 @@
 #     timeout is presumed to belong to a dead process, is broken with a log
 #     line, and the safety-net check above runs immediately afterwards.
 #   - Fail safe, not closed: no personal VPN utun, no saved-routes file,
-#     helpdesk.log unreadable, or PERSONAL_TUNNEL_PREFIX unset -- log why
-#     and do nothing, never guess.
+#     helpdesk.log unreadable, PERSONAL_TUNNEL_PREFIX unset, or a
+#     configured keep-set that cannot be computed -- log why and do
+#     nothing, never guess.
 #
 # Usage: route-lift-watcher.sh [--config DIR] [--timeout N]
+#                               [--trigger connect-start|pre-scan]
 #                               [--dry-run] [--status] [--self-test]
+#                               [--pause [MINUTES]] [--resume]
 #
 # With no --config, reads the installed conf next to this script
 # (route-lift.conf, rendered by install-route-lift-watcher.sh). --config DIR
@@ -84,13 +137,19 @@ REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd 2>/dev/null || echo "$SCRIPT_DIR")
 CONFIG_DIR=""
 CONF_FILE="$SCRIPT_DIR/route-lift.conf"
 TIMEOUT_FLAG=""
+TRIGGER_FLAG=""
 DRY_RUN=0
 STATUS=0
 SELF_TEST=0
+PAUSE_FLAG=0
+PAUSE_MINUTES=""
+RESUME_FLAG=0
 
 PLIST_LABEL="dev.comrades-tunnel.route-lift"
 LOG_FILE="/var/log/comrades-tunnel-route-lift.log"
 HELPDESK_LOG_DEFAULT="/Library/Application Support/Checkpoint/Endpoint Connect/helpdesk.log"
+PAUSE_DEFAULT_MINUTES=60
+PAUSE_MAX_MINUTES=480   # 8h -- a pause must always auto-expire, never be indefinite
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -110,6 +169,14 @@ while [ $# -gt 0 ]; do
             TIMEOUT_FLAG=${1#--timeout=}
             shift
             ;;
+        --trigger)
+            TRIGGER_FLAG=$2
+            shift 2
+            ;;
+        --trigger=*)
+            TRIGGER_FLAG=${1#--trigger=}
+            shift
+            ;;
         --dry-run)
             DRY_RUN=1
             shift
@@ -122,8 +189,26 @@ while [ $# -gt 0 ]; do
             SELF_TEST=1
             shift
             ;;
+        --pause)
+            PAUSE_FLAG=1
+            case "${2:-}" in
+                ''|-*) ;;              # no value, or the next token is another flag
+                *[!0-9]*) ;;           # not a plain integer -- leave it for normal parsing
+                *) PAUSE_MINUTES=$2; shift ;;
+            esac
+            shift
+            ;;
+        --pause=*)
+            PAUSE_FLAG=1
+            PAUSE_MINUTES=${1#--pause=}
+            shift
+            ;;
+        --resume)
+            RESUME_FLAG=1
+            shift
+            ;;
         *)
-            echo "Usage: $0 [--config DIR] [--timeout N] [--dry-run] [--status] [--self-test]" >&2
+            echo "Usage: $0 [--config DIR] [--timeout N] [--trigger connect-start|pre-scan] [--dry-run] [--status] [--self-test] [--pause [MINUTES]] [--resume]" >&2
             exit 2
             ;;
     esac
@@ -137,145 +222,108 @@ case "$TIMEOUT_FLAG" in
         ;;
 esac
 
-# decide_state INITIAL FILE -- given the current persisted INITIAL state
-# ("STARTED" or "IDLE") and a FILE containing zero or more new log lines
-# (either the newly-appended slice of helpdesk.log, or a whole synthetic
-# excerpt for --self-test), return the resulting state. The line number of
-# the LAST connect-start line and the LAST completion/terminal line in FILE
-# are compared; whichever comes later determines the result (ties cannot
-# occur -- they are different lines). If neither pattern appears anywhere in
-# FILE, INITIAL is returned unchanged -- this is why "Interface change",
-# "Trying to reconnect", "Reconnect finished successfully", and "Policy
-# changed, restarting connection" never affect the result: they match
-# neither pattern.
+case "$TRIGGER_FLAG" in
+    ''|connect-start|pre-scan) ;;
+    *)
+        echo "ERROR: --trigger must be connect-start or pre-scan, got '$TRIGGER_FLAG'" >&2
+        exit 2
+        ;;
+esac
+
+if [ "$PAUSE_FLAG" = 1 ]; then
+    [ -z "$PAUSE_MINUTES" ] && PAUSE_MINUTES=$PAUSE_DEFAULT_MINUTES
+    case "$PAUSE_MINUTES" in
+        ''|*[!0-9]*)
+            echo "ERROR: --pause minutes must be a positive integer, got '$PAUSE_MINUTES'" >&2
+            exit 2
+            ;;
+    esac
+    if [ "$PAUSE_MINUTES" -le 0 ]; then
+        echo "ERROR: --pause minutes must be a positive integer, got '$PAUSE_MINUTES'" >&2
+        exit 2
+    fi
+    if [ "$PAUSE_MINUTES" -gt "$PAUSE_MAX_MINUTES" ]; then
+        echo "NOTE: --pause $PAUSE_MINUTES exceeds the ${PAUSE_MAX_MINUTES}-minute (8h) cap; using $PAUSE_MAX_MINUTES." >&2
+        PAUSE_MINUTES=$PAUSE_MAX_MINUTES
+    fi
+fi
+
+# decide_state INITIAL FILE TRIGGER -- given the current persisted INITIAL
+# state ("STARTED", "CONNECTING", or "IDLE") and a FILE containing zero or
+# more new log lines (either the newly-appended slice of helpdesk.log, or a
+# whole synthetic excerpt for --self-test), replay every matching line in
+# FILE, in order, folding it into a running state, and return the result.
+# TRIGGER selects which event actually means "start lifting":
+#   connect-start (default) -- a connect-start line ("Starting connect" or
+#     "Starting new connection") sets STARTED directly, exactly as before
+#     LIFT_TRIGGER existed; the narrower "no need executing firewall step"
+#     marker is never consulted.
+#   pre-scan -- a connect-start line sets the transient CONNECTING state
+#     (seen, not yet lifting); only "no need executing firewall step",
+#     seen *while* CONNECTING, promotes it to STARTED. That marker seen
+#     from IDLE (no connect-start first) is an unrelated occurrence and is
+#     ignored -- this is the gating the header/README promise: pre-scan
+#     can never fire without a connect-start first.
+# Either way, a completion/terminal line (successful connect, "Site is not
+# responding", user-cancelled, user-disconnected) always sets IDLE,
+# regardless of TRIGGER. If FILE matches nothing at all, INITIAL is
+# returned unchanged -- this is why "Interface change", "Trying to
+# reconnect", "Reconnect finished successfully", and "Policy changed,
+# restarting connection" never affect the result: they match no pattern
+# here in any mode.
 decide_state() {
     initial=$1
     file=$2
-    start_line=$(grep -n -E 'Starting connect|Starting new connection' "$file" 2>/dev/null | tail -1 | cut -d: -f1)
-    done_line=$(grep -n -E 'Connection was successfully established|Site is not responding|User cancelled the connection|Disconnect initiated by user' "$file" 2>/dev/null | tail -1 | cut -d: -f1)
-    if [ -z "$start_line" ] && [ -z "$done_line" ]; then
-        printf '%s\n' "$initial"
+    trigger=${3:-connect-start}
+    state=$initial
+    matched=$(grep -n -E 'Starting connect|Starting new connection|no need executing firewall step|Connection was successfully established|Site is not responding|User cancelled the connection|Disconnect initiated by user' "$file" 2>/dev/null)
+    if [ -z "$matched" ]; then
+        printf '%s\n' "$state"
         return 0
     fi
-    if [ -n "$start_line" ] && { [ -z "$done_line" ] || [ "$start_line" -gt "$done_line" ]; }; then
-        printf '%s\n' "STARTED"
-    else
-        printf '%s\n' "IDLE"
-    fi
+    oldifs=$IFS
+    IFS='
+'
+    for line in $matched; do
+        case "$line" in
+            *'no need executing firewall step'*)
+                [ "$state" = "CONNECTING" ] && state=STARTED
+                ;;
+            *'Starting connect'*|*'Starting new connection'*)
+                if [ "$trigger" = "pre-scan" ]; then
+                    state=CONNECTING
+                else
+                    state=STARTED
+                fi
+                ;;
+            *)
+                state=IDLE
+                ;;
+        esac
+    done
+    IFS=$oldifs
+    printf '%s\n' "$state"
 }
 
-# --self-test: exercise decide_state against a fixed table of synthetic
-# helpdesk.log excerpts, independent of any config directory or the real
-# log. All six cases required by the brief; PASS/FAIL per case, non-zero
-# exit on any failure.
-run_self_test() {
-    fail=0
-    tmpfile=$(mktemp) || { echo "FAIL  could not create a temp file for self-test" >&2; return 1; }
-    trap 'rm -f "$tmpfile"' EXIT
-
-    test_case() {
-        desc=$1
-        initial=$2
-        content=$3
-        expected=$4
-        printf '%s' "$content" >"$tmpfile"
-        actual=$(decide_state "$initial" "$tmpfile")
-        if [ "$actual" = "$expected" ]; then
-            echo "PASS  $desc -> $actual"
-        else
-            echo "FAIL  $desc -> $actual (expected $expected)"
-            fail=1
-        fi
-    }
-
-    test_case "fresh 'Starting new connection', no completion yet (trigger)" "IDLE" \
-"[11 Sep 14:47:38] Starting new connection (0x9)
-" "STARTED"
-
-    test_case "same, followed by 'Connection was successfully established' (no trigger)" "IDLE" \
-"[11 Sep 14:47:38] Starting new connection (0x9)
-[11 Sep 14:47:52] Connection was successfully established (0x9)
-" "IDLE"
-
-    test_case "'Interface change'/'Reconnect finished successfully' pair alone (no trigger)" "IDLE" \
-"[11 Sep  1:50:59] Interface change - location is OUT, trying to reconnect
-[11 Sep  1:51:00] Reconnect finished successfully (0x9)
-" "IDLE"
-
-    test_case "'Policy changed, restarting connection' alone (no trigger)" "IDLE" \
-"[10 Sep 11:28:39] Policy changed, restarting connection (0x9)
-" "IDLE"
-
-    test_case "connect-start followed by 'Site is not responding' (terminal, no trigger)" "IDLE" \
-"[11 Sep  0:58:11] Starting connect...
-[11 Sep  1:00:57] IKE connection failed, error code=-1000. Reason: Site is not responding.
-" "IDLE"
-
-    test_case "empty/unchanged tail (no trigger)" "IDLE" "" "IDLE"
-
-    if [ "$fail" = 0 ]; then
-        echo "self-test: all cases PASS"
+# pause_state FILE -- print 0 if FILE is absent, empty, non-numeric, or its
+# recorded expiry (absolute epoch seconds) is not in the future; otherwise
+# print that expiry. Never writes FILE. A pause can only ever collapse back
+# to "not paused" here -- there is no path that manufactures an indefinite
+# one.
+pause_state() {
+    pfile=$1
+    [ -f "$pfile" ] || { echo 0; return 0; }
+    expiry=$(cat "$pfile" 2>/dev/null)
+    case "$expiry" in
+        ''|*[!0-9]*) echo 0; return 0 ;;
+    esac
+    now=$(date +%s)
+    if [ "$expiry" -gt "$now" ]; then
+        echo "$expiry"
     else
-        echo "self-test: at least one case FAILED" >&2
+        echo 0
     fi
-    return "$fail"
 }
-
-if [ "$SELF_TEST" = 1 ]; then
-    run_self_test
-    exit $?
-fi
-
-# --- config resolution (same dual-mode convention as dns-guard.sh: an
-# installed conf file by default, or --config DIR to read a repo config dir
-# directly without installing anything) ---
-if [ -n "$CONFIG_DIR" ]; then
-    TUNNELS_FILE="$CONFIG_DIR/tunnels.txt"
-    if [ ! -f "$TUNNELS_FILE" ]; then
-        echo "ERROR: $TUNNELS_FILE not found (see config/example/tunnels.txt)" >&2
-        exit 2
-    fi
-    PERSONAL_TUNNEL_PREFIX=$(get_tunnel_prefix PERSONAL_TUNNEL_PREFIX)
-    TIMEOUT=240
-    HELPDESK_LOG="$HELPDESK_LOG_DEFAULT"
-    STATE_DIR="$REPO_ROOT/build/route-lift-state"
-else
-    if [ ! -f "$CONF_FILE" ]; then
-        echo "ERROR: $CONF_FILE not found (use --config DIR to read a repo config dir instead)" >&2
-        exit 2
-    fi
-    PERSONAL_TUNNEL_PREFIX=$(grep '^PERSONAL_TUNNEL_PREFIX=' "$CONF_FILE" | tail -1 | cut -d= -f2-)
-    TIMEOUT=$(grep '^TIMEOUT=' "$CONF_FILE" | tail -1 | cut -d= -f2-)
-    HELPDESK_LOG=$(grep '^HELPDESK_LOG=' "$CONF_FILE" | tail -1 | cut -d= -f2-)
-    STATE_DIR=$(grep '^STATE_DIR=' "$CONF_FILE" | tail -1 | cut -d= -f2-)
-    [ -z "$TIMEOUT" ] && TIMEOUT=240
-    [ -z "$HELPDESK_LOG" ] && HELPDESK_LOG="$HELPDESK_LOG_DEFAULT"
-fi
-[ -n "$TIMEOUT_FLAG" ] && TIMEOUT=$TIMEOUT_FLAG
-
-if [ -z "$PERSONAL_TUNNEL_PREFIX" ]; then
-    echo "ERROR: PERSONAL_TUNNEL_PREFIX not set (ambiguous -- fail safe, doing nothing)" >&2
-    exit 2
-fi
-if [ -z "$STATE_DIR" ]; then
-    echo "ERROR: STATE_DIR not set (ambiguous -- fail safe, doing nothing)" >&2
-    exit 2
-fi
-
-# lib-routes.sh's functions expect this global name for the directory they
-# mkdir -p and write SAVED_ROUTES_FILE under (see its header comment). DRY_RUN
-# itself is already the same variable name lib-routes.sh expects.
-BUILD_DIR="$STATE_DIR"
-
-SAVED_ROUTES_FILE="$STATE_DIR/route-lift-saved-routes.txt"
-OFFSET_FILE="$STATE_DIR/offset"
-WATCH_STATE_FILE="$STATE_DIR/state"
-LOCK_DIR="$STATE_DIR/lock"
-
-RESTORE_HAD_FAILURES=0
-RESTORE_VERIFY_FAILED=0
-RESTORE_DONE=0
-LOCK_HELD=0
 
 # log MESSAGE -- timestamped append to LOG_FILE, falling back to stderr if
 # LOG_FILE cannot be written (e.g. running unprivileged), same fallback
@@ -302,9 +350,14 @@ age_seconds() {
 }
 
 # do_restore -- restore_saved_routes + verify_restore (from lib-routes.sh),
-# then clear SAVED_ROUTES_FILE only if both succeeded. See the header
-# comment above for why this differs from cp-connect.sh (which always
-# leaves the file in place): here, file presence must mean "still lifted".
+# then clear SAVED_ROUTES_FILE/KEPT_ROUTES_FILE only if both succeeded. See
+# the header comment above for why this differs from cp-connect.sh (which
+# always leaves the file in place): here, file presence must mean "still
+# lifted". On success also logs and persists (LAST_LIFT_FILE, read by
+# --status) how long the routes were actually gone: SAVED_ROUTES_FILE's own
+# mtime is set by save_amnezia_routes immediately before do_lift deletes
+# anything, so age_seconds() here is a fair (very slightly conservative)
+# measure of the delete-to-verified-restore window.
 do_restore() {
     RESTORE_DONE=1
     log "restoring saved routes from $SAVED_ROUTES_FILE"
@@ -313,8 +366,11 @@ do_restore() {
     restore_saved_routes
     verify_restore
     if [ "$RESTORE_HAD_FAILURES" = 0 ] && [ "$RESTORE_VERIFY_FAILED" = 0 ]; then
-        rm -f "$SAVED_ROUTES_FILE"
+        lifted_seconds=$(age_seconds "$SAVED_ROUTES_FILE")
+        rm -f "$SAVED_ROUTES_FILE" "$KEPT_ROUTES_FILE"
         log "restore verified; cleared $SAVED_ROUTES_FILE"
+        log "lift duration: routes were unavailable for ${lifted_seconds:-unknown}s (from save/delete to verified restore)"
+        printf '%s\n' "${lifted_seconds:-unknown}" >"$LAST_LIFT_FILE" 2>/dev/null
     else
         log "WARNING: restore incomplete or unverified; keeping $SAVED_ROUTES_FILE in place for the safety net / a retry"
     fi
@@ -365,8 +421,12 @@ acquire_lock() {
 
 # do_lift -- enumerate routes on the personal VPN's utun, save them, verify
 # the saved file is non-empty and its line count matches the enumeration
-# taken just before saving, and only then delete them. Never deletes
-# anything it has not first verified it saved.
+# taken just before saving, then run compute_keep_set (lib-routes.sh) to
+# exclude any configured keep-routes-for.txt entries from that saved file
+# before ever deleting anything. Never deletes anything it has not first
+# verified it saved, and never deletes anything at all if the keep-set
+# could not be computed (fail-safe -- see compute_keep_set's own comment
+# and the README).
 do_lift() {
     personal_utun=$(detect_utun_by_prefix "$PERSONAL_TUNNEL_PREFIX")
     if [ -z "$personal_utun" ]; then
@@ -386,9 +446,33 @@ do_lift() {
         rm -f "$SAVED_ROUTES_FILE"
         return 1
     fi
-    log "saved $saved_lines routes from $personal_utun to $SAVED_ROUTES_FILE (verified against $enumerated enumerated); deleting them now"
+
+    cks_err="$STATE_DIR/.compute-keep-set-stderr.$$"
+    if compute_keep_set "$SAVED_ROUTES_FILE" 2>"$cks_err"; then
+        cks_rc=0
+    else
+        cks_rc=1
+    fi
+    if [ -s "$cks_err" ]; then
+        while IFS= read -r kline; do log "$kline"; done <"$cks_err"
+    fi
+    rm -f "$cks_err"
+    if [ "$cks_rc" -ne 0 ]; then
+        log "ERROR: keep-set could not be computed from $KEEP_ROUTES_FILE (see above); fail-safe -- NOT lifting any routes this cycle"
+        rm -f "$SAVED_ROUTES_FILE" "$KEPT_ROUTES_FILE"
+        return 1
+    fi
+    kept_lines=$(wc -l <"$KEPT_ROUTES_FILE" 2>/dev/null | tr -d ' ')
+    [ -z "$kept_lines" ] && kept_lines=0
+    if [ "$kept_lines" -gt 0 ]; then
+        log "keeping $kept_lines route(s) from $personal_utun per $KEEP_ROUTES_FILE:"
+        while IFS= read -r kline; do log "  kept: $kline"; done <"$KEPT_ROUTES_FILE"
+    fi
+
+    to_delete=$(wc -l <"$SAVED_ROUTES_FILE" 2>/dev/null | tr -d ' ')
+    log "saved $saved_lines routes from $personal_utun to $SAVED_ROUTES_FILE (verified against $enumerated enumerated; $kept_lines kept, $to_delete to delete); deleting them now"
     delete_amnezia_routes "$personal_utun" | while IFS= read -r dline; do log "$dline"; done
-    log "lifted (deleted) $saved_lines routes from $personal_utun"
+    log "lifted (deleted) $to_delete routes from $personal_utun"
     return 0
 }
 
@@ -408,8 +492,8 @@ wait_for_completion_then_restore() {
                 slice_file="$STATE_DIR/.slice.$$"
                 tail -c +"$((prev_offset + 1))" "$HELPDESK_LOG" >"$slice_file" 2>/dev/null
                 prev_state=$(cat "$WATCH_STATE_FILE" 2>/dev/null)
-                case "$prev_state" in STARTED|IDLE) ;; *) prev_state=STARTED ;; esac
-                new_state=$(decide_state "$prev_state" "$slice_file")
+                case "$prev_state" in STARTED|IDLE|CONNECTING) ;; *) prev_state=STARTED ;; esac
+                new_state=$(decide_state "$prev_state" "$slice_file" "$TRIGGER")
                 rm -f "$slice_file"
                 echo "$cur_size" >"$OFFSET_FILE"
                 echo "$new_state" >"$WATCH_STATE_FILE"
@@ -436,6 +520,12 @@ wait_for_completion_then_restore() {
 # this script -- see header). Returns 1 (and has already restored) if it
 # acted; 0 otherwise, including every "nothing to check" / "not old enough
 # yet" / "utun missing" case.
+#
+# Deliberately independent of the pause switch (--pause/PAUSE_FILE, see
+# pause_state() and the top of run_decision_cycle's action check): a pause
+# only ever suppresses starting a *new* lift, never restoring one that
+# already happened. This function does not read PAUSE_FILE at all, so a
+# pause can never leave routes lifted past TIMEOUT.
 run_safety_net_check() {
     [ -f "$SAVED_ROUTES_FILE" ] || return 0
     saved_age=$(age_seconds "$SAVED_ROUTES_FILE")
@@ -448,9 +538,13 @@ run_safety_net_check() {
         return 0
     fi
     saved_count=$(wc -l <"$SAVED_ROUTES_FILE" 2>/dev/null | tr -d ' ')
+    kept_count=0
+    [ -f "$KEPT_ROUTES_FILE" ] && kept_count=$(wc -l <"$KEPT_ROUTES_FILE" 2>/dev/null | tr -d ' ')
+    [ -z "$kept_count" ] && kept_count=0
+    expected_count=$((saved_count + kept_count))
     now_count=$(routes_on_iface "$personal_utun")
-    if [ "$now_count" -lt "$saved_count" ] 2>/dev/null; then
-        log "SAFETY-NET: saved-routes file is ${saved_age}s old (> ${TIMEOUT}s) and $personal_utun has $now_count/$saved_count routes -- restoring unconditionally"
+    if [ "$now_count" -lt "$expected_count" ] 2>/dev/null; then
+        log "SAFETY-NET: saved-routes file is ${saved_age}s old (> ${TIMEOUT}s) and $personal_utun has $now_count/$expected_count routes ($saved_count saved + $kept_count kept) -- restoring unconditionally"
         do_restore
         return 1
     fi
@@ -472,16 +566,30 @@ run_decision_cycle() {
         prev_offset=0
     fi
     prev_state=$(cat "$WATCH_STATE_FILE" 2>/dev/null)
-    case "$prev_state" in STARTED|IDLE) ;; *) prev_state=IDLE ;; esac
+    case "$prev_state" in STARTED|IDLE|CONNECTING) ;; *) prev_state=IDLE ;; esac
 
     mkdir -p "$STATE_DIR"
     slice_file="$STATE_DIR/.slice.$$"
     tail -c +"$((prev_offset + 1))" "$HELPDESK_LOG" >"$slice_file" 2>/dev/null
-    new_state=$(decide_state "$prev_state" "$slice_file")
+    new_state=$(decide_state "$prev_state" "$slice_file" "$TRIGGER")
     rm -f "$slice_file"
 
     echo "$cur_size" >"$OFFSET_FILE"
     echo "$new_state" >"$WATCH_STATE_FILE"
+
+    # A pause suppresses only the lift/restore ACTION below -- the offset
+    # and state files above are still advanced every cycle, specifically so
+    # that once the pause expires this resumes from "now" instead of
+    # folding a whole pause window's backlog into one slice (a burst of
+    # catch-up decisions). run_safety_net_check (called by our caller
+    # before this function ever runs) is entirely separate from this check
+    # and always runs regardless of pause -- see its own comment.
+    pause_expiry=$(pause_state "$PAUSE_FILE")
+    if [ "$pause_expiry" != 0 ]; then
+        paused_until=$(date -r "$pause_expiry" '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null)
+        log "paused until ${paused_until:-$pause_expiry} ($PAUSE_FILE); recorded state ($new_state) but taking no lift/restore action"
+        return 0
+    fi
 
     if [ -f "$SAVED_ROUTES_FILE" ]; then
         already_lifted=1
@@ -500,6 +608,14 @@ run_decision_cycle() {
             fi
             [ "$already_lifted" = 1 ] && wait_for_completion_then_restore
             ;;
+        CONNECTING)
+            if [ "$already_lifted" = 1 ]; then
+                log "connect-start observed while routes were already lifted; continuing to wait for completion"
+                wait_for_completion_then_restore
+            else
+                log "connect-start seen (pre-scan trigger); waiting for the pre-scan marker before lifting"
+            fi
+            ;;
         IDLE)
             if [ "$already_lifted" = 1 ]; then
                 log "completion/idle observed while routes were still lifted; restoring now"
@@ -511,19 +627,358 @@ run_decision_cycle() {
     esac
 }
 
+# run_self_test: exercise decide_state against a fixed table of synthetic
+# helpdesk.log excerpts (both LIFT_TRIGGER modes), pause_state() against
+# future/past/missing expiries, the pause switch's effect (and non-effect
+# on the offset/state bookkeeping) inside run_decision_cycle, the
+# independence of run_safety_net_check from an active pause, and
+# keep-routes.py's own --self-test. PASS/FAIL per case; non-zero exit on
+# any failure. Independent of any config directory or the real log/state
+# dir -- everything here uses its own temp files.
+run_self_test() {
+    fail=0
+    tmpfile=$(mktemp) || { echo "FAIL  could not create a temp file for self-test" >&2; return 1; }
+    trap 'rm -f "$tmpfile"' EXIT
+
+    test_case() {
+        desc=$1
+        initial=$2
+        content=$3
+        expected=$4
+        trigger=${5:-connect-start}
+        printf '%s' "$content" >"$tmpfile"
+        actual=$(decide_state "$initial" "$tmpfile" "$trigger")
+        if [ "$actual" = "$expected" ]; then
+            echo "PASS  [$trigger] $desc -> $actual"
+        else
+            echo "FAIL  [$trigger] $desc -> $actual (expected $expected)"
+            fail=1
+        fi
+    }
+
+    # --- connect-start trigger (default): the original six cases ---
+    test_case "fresh 'Starting new connection', no completion yet (trigger)" "IDLE" \
+"[11 Sep 14:47:38] Starting new connection (0x9)
+" "STARTED" connect-start
+
+    test_case "same, followed by 'Connection was successfully established' (no trigger)" "IDLE" \
+"[11 Sep 14:47:38] Starting new connection (0x9)
+[11 Sep 14:47:52] Connection was successfully established (0x9)
+" "IDLE" connect-start
+
+    test_case "'Interface change'/'Reconnect finished successfully' pair alone (no trigger)" "IDLE" \
+"[11 Sep  1:50:59] Interface change - location is OUT, trying to reconnect
+[11 Sep  1:51:00] Reconnect finished successfully (0x9)
+" "IDLE" connect-start
+
+    test_case "'Policy changed, restarting connection' alone (no trigger)" "IDLE" \
+"[10 Sep 11:28:39] Policy changed, restarting connection (0x9)
+" "IDLE" connect-start
+
+    test_case "connect-start followed by 'Site is not responding' (terminal, no trigger)" "IDLE" \
+"[11 Sep  0:58:11] Starting connect...
+[11 Sep  1:00:57] IKE connection failed, error code=-1000. Reason: Site is not responding.
+" "IDLE" connect-start
+
+    test_case "empty/unchanged tail (no trigger)" "IDLE" "" "IDLE" connect-start
+
+    # --- pre-scan trigger: the narrower window (see README) ---
+    test_case "connect-start then pre-scan marker (trigger)" "IDLE" \
+"[11 Sep 11:23:28] Starting new connection (0x9)
+[11 Sep 11:23:44] no need executing firewall step
+" "STARTED" pre-scan
+
+    test_case "pre-scan marker with NO preceding connect-start (no trigger -- unrelated occurrence)" "IDLE" \
+"[11 Sep 11:23:44] no need executing firewall step
+" "IDLE" pre-scan
+
+    test_case "connect-start alone, no pre-scan marker yet (no trigger under pre-scan -- still waiting)" "IDLE" \
+"[11 Sep 11:23:28] Starting new connection (0x9)
+" "CONNECTING" pre-scan
+
+    test_case "same connect-start-alone input, but under connect-start trigger (trigger)" "IDLE" \
+"[11 Sep 11:23:28] Starting new connection (0x9)
+" "STARTED" connect-start
+
+    # --- pause switch: pause_state() is a pure function of the pause
+    # file's content and the current time; it never writes the file.
+    pause_tmp=$(mktemp -d) || { echo "FAIL  could not create a temp dir for pause self-test" >&2; fail=1; pause_tmp=""; }
+    if [ -n "$pause_tmp" ]; then
+        future_file="$pause_tmp/future"
+        past_file="$pause_tmp/past"
+        echo $(( $(date +%s) + 3600 )) >"$future_file"
+        echo $(( $(date +%s) - 10 )) >"$past_file"
+
+        result=$(pause_state "$future_file")
+        if [ "$result" != 0 ]; then
+            echo "PASS  pause_state: future expiry -> active (expiry=$result)"
+        else
+            echo "FAIL  pause_state: future expiry -> $result (expected a nonzero epoch)"
+            fail=1
+        fi
+
+        result=$(pause_state "$past_file")
+        if [ "$result" = 0 ]; then
+            echo "PASS  pause_state: past expiry -> not paused (treated as expired)"
+        else
+            echo "FAIL  pause_state: past expiry -> $result (expected 0 / not paused)"
+            fail=1
+        fi
+
+        result=$(pause_state "$pause_tmp/does-not-exist")
+        if [ "$result" = 0 ]; then
+            echo "PASS  pause_state: missing file -> not paused"
+        else
+            echo "FAIL  pause_state: missing file -> $result (expected 0)"
+            fail=1
+        fi
+
+        # Integration: a future pause must stop run_decision_cycle's own
+        # lift/restore action even though the log alone says a connect just
+        # started (decide_state would return STARTED) -- but it must still
+        # advance the offset/state bookkeeping (see the comment at the top
+        # of that check inside run_decision_cycle). PERSONAL_TUNNEL_PREFIX
+        # below is TEST-NET-3 (RFC 5737), guaranteed not to match any real
+        # utun, so even if this bug existed and do_lift ran for real, it
+        # would stop at its own "no personal VPN utun found" fail-safe
+        # without ever touching a route.
+        cycle_dir="$pause_tmp/cycle"
+        mkdir -p "$cycle_dir"
+        STATE_DIR="$cycle_dir"
+        SAVED_ROUTES_FILE="$cycle_dir/saved-routes.txt"
+        KEPT_ROUTES_FILE="$cycle_dir/kept-routes.txt"
+        OFFSET_FILE="$cycle_dir/offset"
+        WATCH_STATE_FILE="$cycle_dir/state"
+        LOG_FILE="$cycle_dir/log"
+        LAST_LIFT_FILE="$cycle_dir/last-lift"
+        PAUSE_FILE="$future_file"
+        HELPDESK_LOG="$cycle_dir/helpdesk.log"
+        PERSONAL_TUNNEL_PREFIX="203.0.113."
+        KEEP_ROUTES_FILE="$cycle_dir/keep-routes-for.txt"
+        TIMEOUT=240
+        DRY_RUN=0
+        TRIGGER=connect-start
+        printf '%s\n' "[11 Sep 10:00:00] Starting new connection (0x9)" >"$HELPDESK_LOG"
+
+        run_decision_cycle
+        cycle_log=$(cat "$LOG_FILE" 2>/dev/null)
+        watch_state=$(cat "$WATCH_STATE_FILE" 2>/dev/null)
+        case "$cycle_log" in
+            *paused*)
+                if [ "$watch_state" = "STARTED" ] && [ ! -f "$SAVED_ROUTES_FILE" ]; then
+                    echo "PASS  paused (future expiry): connect-start logged but no lift attempted, state still advanced to STARTED"
+                else
+                    saved_exists=no
+                    [ -f "$SAVED_ROUTES_FILE" ] && saved_exists=yes
+                    echo "FAIL  paused (future expiry): unexpected watch_state='$watch_state' saved_routes_exists=$saved_exists"
+                    fail=1
+                fi
+                ;;
+            *)
+                echo "FAIL  paused (future expiry): run_decision_cycle did not log a paused message; log was: $cycle_log"
+                fail=1
+                ;;
+        esac
+
+        # Safety net independence: an active pause must not change the
+        # decision run_safety_net_check reaches for an old saved-routes
+        # file. PERSONAL_TUNNEL_PREFIX above never matches a real utun, so
+        # this stops at "cannot verify or restore" without ever touching a
+        # route -- compare that outcome with and without a pause file
+        # present alongside the same saved-routes file.
+        net_dir="$pause_tmp/net"
+        mkdir -p "$net_dir"
+        STATE_DIR="$net_dir"
+        SAVED_ROUTES_FILE="$net_dir/saved-routes.txt"
+        KEPT_ROUTES_FILE="$net_dir/kept-routes.txt"
+        LOG_FILE="$net_dir/log"
+        printf '203.0.113.5/32 utun9\n' >"$SAVED_ROUTES_FILE"
+        touch -t 202001010000 "$SAVED_ROUTES_FILE"
+        TIMEOUT=0
+
+        PAUSE_FILE="$net_dir/paused-until"
+        rm -f "$PAUSE_FILE" "$LOG_FILE"
+        run_safety_net_check
+        rc_nopause=$?
+        log_nopause=$(cat "$LOG_FILE" 2>/dev/null)
+
+        echo $(( $(date +%s) + 3600 )) >"$PAUSE_FILE"
+        rm -f "$LOG_FILE"
+        run_safety_net_check
+        rc_paused=$?
+        log_paused=$(cat "$LOG_FILE" 2>/dev/null)
+
+        if [ "$rc_nopause" = "$rc_paused" ] && [ "$log_nopause" = "$log_paused" ] && \
+           printf '%s' "$log_paused" | grep -q "cannot verify or restore"; then
+            echo "PASS  safety net with a saved-routes file present reaches the same restore-path decision whether or not a pause is active"
+        else
+            echo "FAIL  safety net pause independence: rc_nopause=$rc_nopause rc_paused=$rc_paused log_nopause='$log_nopause' log_paused='$log_paused'"
+            fail=1
+        fi
+
+        rm -rf "$pause_tmp"
+    fi
+
+    # --- keep-routes: containment/fail-safe unit tests live in
+    # keep-routes.py itself (native language for CIDR arithmetic); fold its
+    # result into ours so one --self-test command covers everything.
+    if command -v python3 >/dev/null 2>&1; then
+        kr_out=$(python3 "$SCRIPT_DIR/keep-routes.py" --self-test)
+        kr_rc=$?
+        printf '%s\n' "$kr_out"
+        [ "$kr_rc" -ne 0 ] && fail=1
+    else
+        echo "FAIL  keep-routes.py --self-test: python3 not available to run it" >&2
+        fail=1
+    fi
+
+    if [ "$fail" = 0 ]; then
+        echo "self-test: all cases PASS"
+    else
+        echo "self-test: at least one case FAILED" >&2
+    fi
+    return "$fail"
+}
+
+if [ "$SELF_TEST" = 1 ]; then
+    run_self_test
+    exit $?
+fi
+
+# --- config resolution (same dual-mode convention as dns-guard.sh: an
+# installed conf file by default, or --config DIR to read a repo config dir
+# directly without installing anything) ---
+if [ -n "$CONFIG_DIR" ]; then
+    TUNNELS_FILE="$CONFIG_DIR/tunnels.txt"
+    if [ ! -f "$TUNNELS_FILE" ]; then
+        echo "ERROR: $TUNNELS_FILE not found (see config/example/tunnels.txt)" >&2
+        exit 2
+    fi
+    PERSONAL_TUNNEL_PREFIX=$(get_tunnel_prefix PERSONAL_TUNNEL_PREFIX)
+    TRIGGER=$(get_tunnel_prefix LIFT_TRIGGER)
+    TIMEOUT=240
+    HELPDESK_LOG="$HELPDESK_LOG_DEFAULT"
+    STATE_DIR="$REPO_ROOT/build/route-lift-state"
+    KEEP_ROUTES_FILE="$CONFIG_DIR/keep-routes-for.txt"
+else
+    if [ ! -f "$CONF_FILE" ]; then
+        echo "ERROR: $CONF_FILE not found (use --config DIR to read a repo config dir instead)" >&2
+        exit 2
+    fi
+    PERSONAL_TUNNEL_PREFIX=$(grep '^PERSONAL_TUNNEL_PREFIX=' "$CONF_FILE" | tail -1 | cut -d= -f2-)
+    TRIGGER=$(grep '^LIFT_TRIGGER=' "$CONF_FILE" | tail -1 | cut -d= -f2-)
+    TIMEOUT=$(grep '^TIMEOUT=' "$CONF_FILE" | tail -1 | cut -d= -f2-)
+    HELPDESK_LOG=$(grep '^HELPDESK_LOG=' "$CONF_FILE" | tail -1 | cut -d= -f2-)
+    STATE_DIR=$(grep '^STATE_DIR=' "$CONF_FILE" | tail -1 | cut -d= -f2-)
+    [ -z "$TIMEOUT" ] && TIMEOUT=240
+    [ -z "$HELPDESK_LOG" ] && HELPDESK_LOG="$HELPDESK_LOG_DEFAULT"
+    KEEP_ROUTES_FILE="$SCRIPT_DIR/keep-routes-for.txt"
+fi
+[ -z "$TRIGGER" ] && TRIGGER=connect-start
+[ -n "$TRIGGER_FLAG" ] && TRIGGER=$TRIGGER_FLAG
+case "$TRIGGER" in
+    connect-start|pre-scan) ;;
+    *)
+        echo "ERROR: invalid LIFT_TRIGGER/--trigger '$TRIGGER' (expected connect-start or pre-scan)" >&2
+        exit 2
+        ;;
+esac
+[ -n "$TIMEOUT_FLAG" ] && TIMEOUT=$TIMEOUT_FLAG
+
+if [ -z "$PERSONAL_TUNNEL_PREFIX" ]; then
+    echo "ERROR: PERSONAL_TUNNEL_PREFIX not set (ambiguous -- fail safe, doing nothing)" >&2
+    exit 2
+fi
+if [ -z "$STATE_DIR" ]; then
+    echo "ERROR: STATE_DIR not set (ambiguous -- fail safe, doing nothing)" >&2
+    exit 2
+fi
+
+# lib-routes.sh's functions expect this global name for the directory they
+# mkdir -p and write SAVED_ROUTES_FILE under (see its header comment). DRY_RUN
+# itself is already the same variable name lib-routes.sh expects.
+BUILD_DIR="$STATE_DIR"
+
+SAVED_ROUTES_FILE="$STATE_DIR/route-lift-saved-routes.txt"
+OFFSET_FILE="$STATE_DIR/offset"
+WATCH_STATE_FILE="$STATE_DIR/state"
+LOCK_DIR="$STATE_DIR/lock"
+PAUSE_FILE="$STATE_DIR/paused-until"
+LAST_LIFT_FILE="$STATE_DIR/last-lift-duration"
+KEEP_ROUTES_SCRIPT="$SCRIPT_DIR/keep-routes.py"
+KEPT_ROUTES_FILE="$STATE_DIR/route-lift-kept-routes.txt"
+
+RESTORE_HAD_FAILURES=0
+RESTORE_VERIFY_FAILED=0
+RESTORE_DONE=0
+LOCK_HELD=0
+
+# --- --pause / --resume: state-file operations only. Whether these need
+# sudo depends entirely on where STATE_DIR lives: under --config DIR it is
+# REPO_ROOT/build/route-lift-state (user-owned, no sudo); against the
+# installed conf it is the root:wheel, mode-755 directory
+# install-route-lift-watcher.sh creates, so a normal user cannot write
+# PAUSE_FILE there -- see the README and the Makefile's route-lift-pause/
+# route-lift-resume targets, which use sudo for exactly that reason. ---
+if [ "$PAUSE_FLAG" = 1 ]; then
+    if ! mkdir -p "$STATE_DIR" 2>/dev/null; then
+        echo "ERROR: cannot create $STATE_DIR (needs sudo? see README)" >&2
+        exit 1
+    fi
+    expiry=$(( $(date +%s) + PAUSE_MINUTES * 60 ))
+    if ! echo "$expiry" >"$PAUSE_FILE" 2>/dev/null; then
+        echo "ERROR: cannot write $PAUSE_FILE (needs sudo? see README)" >&2
+        exit 1
+    fi
+    human=$(date -r "$expiry" '+%Y-%m-%d %H:%M:%S%z' 2>/dev/null)
+    echo "Paused: routes will not be lifted for an automatic corporate-VPN reconnect until ${human:-$expiry} (${PAUSE_MINUTES}m from now)."
+    echo "Corporate VPN connects will be slow again while paused (2-3.5 minutes) -- see README."
+    echo "The safety net still restores any already-lifted routes regardless of this pause."
+    echo "Resume early with: $0${CONFIG_DIR:+ --config \"$CONFIG_DIR\"} --resume"
+    exit 0
+fi
+
+if [ "$RESUME_FLAG" = 1 ]; then
+    if [ -f "$PAUSE_FILE" ]; then
+        rm -f "$PAUSE_FILE"
+        echo "Resumed: the watcher will act on the next corporate-VPN reconnect again."
+    else
+        echo "Not paused ($PAUSE_FILE does not exist); nothing to resume."
+    fi
+    exit 0
+fi
+
 # --- --status ---
 if [ "$STATUS" = 1 ]; then
     echo "=== route-lift-watcher status ==="
     echo "Config: ${CONFIG_DIR:-$CONF_FILE}"
+    echo "Trigger: $TRIGGER"
     echo "State dir: $STATE_DIR"
     if [ -f "$SAVED_ROUTES_FILE" ]; then
         age=$(age_seconds "$SAVED_ROUTES_FILE")
         lines=$(wc -l <"$SAVED_ROUTES_FILE" 2>/dev/null | tr -d ' ')
         echo "Routes lifted: YES"
         echo "Saved-routes file: $SAVED_ROUTES_FILE (age: ${age:-unknown}s, $lines routes)"
+        if [ -f "$KEPT_ROUTES_FILE" ]; then
+            kept=$(wc -l <"$KEPT_ROUTES_FILE" 2>/dev/null | tr -d ' ')
+            echo "Routes kept (per $KEEP_ROUTES_FILE): $kept"
+        fi
     else
         echo "Routes lifted: NO"
         echo "Saved-routes file: none ($SAVED_ROUTES_FILE)"
+    fi
+    if [ -f "$LAST_LIFT_FILE" ]; then
+        last_lift=$(cat "$LAST_LIFT_FILE" 2>/dev/null)
+        echo "Last completed lift: routes were unavailable for ${last_lift:-unknown}s"
+    else
+        echo "Last completed lift: none recorded yet"
+    fi
+    pause_expiry=$(pause_state "$PAUSE_FILE")
+    if [ "$pause_expiry" != 0 ]; then
+        paused_until=$(date -r "$pause_expiry" '+%Y-%m-%d %H:%M:%S%z' 2>/dev/null)
+        echo "Paused: YES, until ${paused_until:-$pause_expiry}"
+    else
+        echo "Paused: NO"
     fi
     echo
     echo "Last 10 log lines ($LOG_FILE):"
@@ -545,6 +1000,7 @@ fi
 if [ "$DRY_RUN" = 1 ]; then
     echo "=== route-lift-watcher: dry-run (touches nothing) ==="
     echo "Config: ${CONFIG_DIR:-$CONF_FILE}"
+    echo "Trigger: $TRIGGER"
     echo "helpdesk.log: $HELPDESK_LOG"
     echo "State dir: $STATE_DIR"
     echo "Timeout: ${TIMEOUT}s"
@@ -563,7 +1019,7 @@ if [ "$DRY_RUN" = 1 ]; then
         prev_offset=0
     fi
     prev_state=$(cat "$WATCH_STATE_FILE" 2>/dev/null)
-    case "$prev_state" in STARTED|IDLE) ;; *) prev_state=IDLE ;; esac
+    case "$prev_state" in STARTED|IDLE|CONNECTING) ;; *) prev_state=IDLE ;; esac
 
     echo "Persisted offset: $prev_offset   Current file size: $cur_size bytes   New bytes: $((cur_size - prev_offset))"
     [ "$rotated" = 1 ] && echo "NOTE: persisted offset exceeded the file size -- log rotation detected, would reset offset to 0"
@@ -572,11 +1028,15 @@ if [ "$DRY_RUN" = 1 ]; then
     slice_file=$(mktemp)
     tail -c +"$((prev_offset + 1))" "$HELPDESK_LOG" >"$slice_file" 2>/dev/null
     start_line=$(grep -n -E 'Starting connect|Starting new connection' "$slice_file" | tail -1)
+    prescan_line=$(grep -n -E 'no need executing firewall step' "$slice_file" | tail -1)
     done_line=$(grep -n -E 'Connection was successfully established|Site is not responding|User cancelled the connection|Disconnect initiated by user' "$slice_file" | tail -1)
-    new_state=$(decide_state "$prev_state" "$slice_file")
+    new_state=$(decide_state "$prev_state" "$slice_file" "$TRIGGER")
     rm -f "$slice_file"
 
     echo "Most recent connect-start line in the new bytes: ${start_line:-<none>}"
+    if [ "$TRIGGER" = "pre-scan" ]; then
+        echo "Most recent pre-scan marker ('no need executing firewall step') in the new bytes: ${prescan_line:-<none>}"
+    fi
     echo "Most recent completion/terminal line in the new bytes: ${done_line:-<none>}"
     echo
     if [ -f "$SAVED_ROUTES_FILE" ]; then
@@ -584,11 +1044,47 @@ if [ "$DRY_RUN" = 1 ]; then
     else
         echo "Routes currently lifted: NO"
     fi
+    pause_expiry=$(pause_state "$PAUSE_FILE")
+    if [ "$pause_expiry" != 0 ]; then
+        paused_until=$(date -r "$pause_expiry" '+%Y-%m-%d %H:%M:%S%z' 2>/dev/null)
+        echo "Paused: YES, until ${paused_until:-$pause_expiry} -- a live run would take no lift/restore action regardless of the decision below"
+    fi
     echo
     case "$new_state" in
-        STARTED) echo "DECISION: would lift the personal VPN's routes (a corporate-VPN connect looks to be in progress)." ;;
+        STARTED) echo "DECISION: would lift the personal VPN's routes (a corporate-VPN connect looks to be in progress, trigger=$TRIGGER)." ;;
+        CONNECTING) echo "DECISION: no action yet -- a connect-start was seen but the pre-scan marker has not (trigger=pre-scan); would keep waiting." ;;
         IDLE)    echo "DECISION: no action -- no corporate-VPN connect currently in progress." ;;
     esac
+
+    echo
+    echo "Keep-routes preview ($KEEP_ROUTES_FILE, resolving for real -- read-only, touches nothing):"
+    kr_preview_utun=$(detect_utun_by_prefix "$PERSONAL_TUNNEL_PREFIX")
+    if [ -z "$kr_preview_utun" ]; then
+        echo "  (no personal VPN utun found; cannot preview)"
+    else
+        # Use throwaway temp files instead of the real STATE_DIR/
+        # KEPT_ROUTES_FILE paths -- a dry-run must not even create
+        # STATE_DIR, which may not exist yet.
+        kr_preview_file=$(mktemp)
+        KEPT_ROUTES_FILE=$(mktemp)
+        netstat -rn -f inet 2>/dev/null | awk -v i="$kr_preview_utun" '$NF==i {print $1, $2}' |
+        while read -r dest gw; do
+            [ -z "$dest" ] && continue
+            echo "$(normalize_dest "$dest") $gw"
+        done >"$kr_preview_file"
+        if compute_keep_set "$kr_preview_file"; then
+            if [ -s "$KEPT_ROUTES_FILE" ]; then
+                echo "  would keep $(wc -l <"$KEPT_ROUTES_FILE" | tr -d ' ') route(s):"
+                while IFS= read -r kline; do echo "    kept: $kline"; done <"$KEPT_ROUTES_FILE"
+            else
+                echo "  would keep 0 routes (no active entries, or none matched)"
+            fi
+        else
+            echo "  a live lift would REFUSE this cycle -- keep-set could not be computed (see above)"
+        fi
+        rm -f "$kr_preview_file" "$KEPT_ROUTES_FILE"
+    fi
+
     echo "(offset/state files NOT written; nothing lifted, deleted, or restored -- this is a preview only.)"
     exit 0
 fi
