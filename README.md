@@ -368,6 +368,41 @@ Check Point выдаёт Office Mode адрес динамически, поэт
 ничего не трогая (иначе измеренное время подключения было бы бессмысленным);
 `--force` снимает этот отказ, а время подключения тогда печатается как `n/a`.
 
+### Автоматика: bin/route-lift-watcher.sh
+
+`cp-connect.sh` ужимает таблицу только когда корпоративный VPN подключает
+человек вручную. Но полное переподключение Check Point происходит и само —
+по журналу `helpdesk.log` за 295 дней видно примерно 1.5–2 автоматических
+полных переподключения в день (выход из сна, roaming timeout, always-connect
+retry), и раньше каждое платило те же 2–3.5 минуты. `route-lift-watcher.sh`
+следит за тем же `helpdesk.log`, которым пишет сам Check Point: строка
+"Starting connect"/"Starting new connection" без последующего "Connection was
+successfully established" — сигнал начать; на короткие "Interface change" /
+"Reconnect finished successfully" и "Policy changed, restarting connection"
+(виртуальный адаптер не пересоздаётся) он не реагирует. При срабатывании
+скрипт сохраняет и удаляет маршруты личного VPN тем же кодом, что и
+`cp-connect.sh --method routes` (общий `bin/lib-routes.sh`), ждёт завершения
+подключения или таймаута (по умолчанию 240с) и восстанавливает маршруты.
+
+Сети предохранителей, каждая независимо: жёсткий таймаут восстанавливает
+маршруты безусловно; `trap` на EXIT/INT/TERM восстанавливает их при любом
+завершении процесса; отдельная периодическая проверка (раз в минуту,
+`StartInterval`) обнаруживает и чинит рассинхронизацию за минуту, даже если
+процесс, который удалил маршруты, аварийно завершился; блокировка на
+`mkdir` не даёт двум срабатываниям выполняться одновременно.
+
+Установка (сначала dry-run, затем применить):
+
+```
+sh bin/install-route-lift-watcher.sh
+sudo sh bin/install-route-lift-watcher.sh --apply
+```
+
+Удаление: `sudo sh bin/install-route-lift-watcher.sh --uninstall`. Лог:
+`/var/log/comrades-tunnel-route-lift.log`. Статус: `make route-lift-status`
+(или `sh bin/route-lift-watcher.sh --status`). Скрипт трогает только
+маршруты личного VPN — сам корпоративный клиент он никогда не изменяет.
+
 ## Ограничения
 
 - Только IPv4 — разбиение по сайтам в Amnezia не поддерживает IPv6.
@@ -387,6 +422,9 @@ bin/
   install-dns-guard.sh   установка dns-guard.sh как LaunchDaemon
   check-split.sh         проверка фактического разбиения маршрутов
   cp-connect.sh          ужать таблицу маршрутизации на время подключения Check Point
+  lib-routes.sh          общие функции сохранения/удаления/восстановления маршрутов
+  route-lift-watcher.sh  автоматически ужимать таблицу при АВТОМАТИЧЕСКОМ переподключении Check Point
+  install-route-lift-watcher.sh   установка route-lift-watcher.sh как LaunchDaemon
 config/
   example/               шаблон конфигурации (плейсхолдеры, безопасно коммитить)
   presets/                готовые списки, например direct-domains.ru-popular.txt

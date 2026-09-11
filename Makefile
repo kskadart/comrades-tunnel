@@ -117,6 +117,14 @@ cp-connect: ## Connect the corporate VPN quickly by shrinking the routing table 
 cp-connect-dry: ## Show what cp-connect would do, without touching anything
 	@sh "$(ROOT)/bin/cp-connect.sh" --config "$(CONFIG)" --dry-run
 
+.PHONY: route-lift
+route-lift: ## Dry-run: what the route-lift watcher would decide right now against the real log
+	@sh "$(ROOT)/bin/route-lift-watcher.sh" --config "$(CONFIG)" --dry-run
+
+.PHONY: route-lift-status
+route-lift-status: ## Show whether routes are lifted, the saved-routes file, recent log lines, and whether the daemon is loaded
+	@sh "$(ROOT)/bin/route-lift-watcher.sh" --config "$(CONFIG)" --status
+
 ##@ Install (sudo)
 .PHONY: resolvers-apply
 resolvers-apply: ## Write /etc/resolver/<zone> files (sudo)
@@ -132,6 +140,16 @@ dns-guard-install: ## Install and start the DNS guard LaunchDaemon (sudo)
 dns-guard-uninstall: ## Stop and remove the DNS guard LaunchDaemon (sudo)
 	@echo "WARNING: will stop and remove the DNS guard LaunchDaemon and installed files under sudo."
 	@sudo sh "$(ROOT)/bin/install-dns-guard.sh" --config "$(CONFIG)" --uninstall
+
+.PHONY: route-lift-install
+route-lift-install: ## Install and load the route-lift watcher LaunchDaemon (sudo)
+	@echo "WARNING: will install the route-lift watcher LaunchDaemon system-wide under sudo."
+	@sudo sh "$(ROOT)/bin/install-route-lift-watcher.sh" --config "$(CONFIG)" --apply
+
+.PHONY: route-lift-uninstall
+route-lift-uninstall: ## Stop and remove the route-lift watcher LaunchDaemon (sudo)
+	@echo "WARNING: will stop and remove the route-lift watcher LaunchDaemon and installed files under sudo."
+	@sudo sh "$(ROOT)/bin/install-route-lift-watcher.sh" --config "$(CONFIG)" --uninstall
 
 .PHONY: dns-reset
 dns-reset: ## Reset the primary service's DNS back to DHCP (sudo)
