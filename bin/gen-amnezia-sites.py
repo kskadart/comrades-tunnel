@@ -72,7 +72,8 @@ amnezia-vpn/amnezia-client, client/core/controllers/ipSplitTunnelingController.c
 Usage:
     gen-amnezia-sites.py [--config DIR] [--dry-run] [--mode {forward,exclude}]
                          [--gateway-mode {direct,tunnel}] [--no-asn]
-                         [--refresh] [--max-sites N]
+                         [--refresh] [--max-sites N] [--resolve-timeout N]
+                         [--fallback-dns IP] [--self-test]
 
 direct-domains.txt syntax (optional second token after the domain):
     <domain>            expand to whole ASN when safe (RU-country, under cap)
@@ -84,10 +85,13 @@ import heapq
 import ipaddress
 import json
 import os
+import random
 import re
 import socket
+import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -131,6 +135,15 @@ RIPENCC_URL = "https://ftp.ripe.net/pub/stats/ripencc/delegated-ripencc-extended
 NETWORK_INFO_URL = "https://stat.ripe.net/data/network-info/data.json?resource={ip}&sourceapp=comrades-tunnel"
 ANNOUNCED_PREFIXES_URL = "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS{asn}&sourceapp=comrades-tunnel"
 AS_OVERVIEW_URL = "https://stat.ripe.net/data/as-overview/data.json?resource=AS{asn}&sourceapp=comrades-tunnel"
+
+# DNS resolution tunables (see resolve_ipv4()/dns_query_a() below): bounding
+# every hostname lookup matters specifically because /etc/resolver/<zone>
+# points corporate-zone lookups at corporate DNS servers that are only
+# reachable through the corporate VPN tunnel -- with the tunnel down, the
+# system resolver retries unreachable servers for a long time per host.
+DEFAULT_RESOLVE_TIMEOUT = 5.0  # seconds; hard cap per system-resolver lookup
+DEFAULT_FALLBACK_DNS = "1.1.1.1"  # public resolver for corp-hosts-check.txt
+DNS_FALLBACK_TIMEOUT = 3.0  # seconds; one attempt against --fallback-dns
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -184,14 +197,257 @@ def read_direct_domains(path: Path) -> list:
     return out
 
 
-def resolve_ipv4(host: str) -> list:
-    """Resolve a hostname to its IPv4 addresses. Warn and continue on failure."""
-    try:
-        infos = socket.getaddrinfo(host, None, socket.AF_INET)
-    except socket.gaierror as exc:
-        print(f"WARNING: failed to resolve '{host}': {exc}")
+def resolve_ipv4(host: str, timeout: float = DEFAULT_RESOLVE_TIMEOUT) -> list:
+    """Resolve a hostname to its IPv4 addresses via the system resolver, with
+    a hard wall-clock cap of `timeout` seconds. Warn and continue on failure.
+
+    socket.getaddrinfo() has no timeout of its own -- when /etc/resolver/
+    <zone> points a corporate zone at corporate DNS servers that are only
+    reachable through the corporate VPN tunnel, an unreachable resolver makes
+    getaddrinfo() block for a long time (the system resolver retries each
+    configured server with its own multi-second timeout). So the actual
+    lookup runs in a daemon thread that this function joins with `timeout`:
+    if the thread is still running when the join returns, the lookup is
+    treated exactly like a resolution failure and abandoned -- the thread
+    keeps blocking on the real, unreachable resolver in the background, but
+    because it is a daemon thread it never delays process exit.
+    """
+    outcome = {}
+
+    def worker():
+        try:
+            infos = socket.getaddrinfo(host, None, socket.AF_INET)
+            outcome["ips"] = sorted({info[4][0] for info in infos})
+        except socket.gaierror as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        print(f"WARNING: failed to resolve '{host}': timed out after {timeout}s")
         return []
-    return sorted({info[4][0] for info in infos})
+    if "error" in outcome:
+        print(f"WARNING: failed to resolve '{host}': {outcome['error']}")
+        return []
+    return outcome.get("ips", [])
+
+
+def _skip_dns_name(data: bytes, offset: int) -> int:
+    """Advance past one DNS-encoded name (RFC 1035 SS4.1.4, including pointer
+    compression) starting at `offset`; return the offset of the first byte
+    after it. Used only to walk past names in a reply this code itself
+    parses (question/answer sections of dns_query_a()'s own response)."""
+    while offset < len(data):
+        length = data[offset]
+        if length & 0xC0 == 0xC0:  # compression pointer: 2 bytes, then done
+            return offset + 2
+        if length == 0:
+            return offset + 1
+        offset += 1 + length
+    return offset
+
+
+def dns_query_a(qname: str, server: str, timeout: float = DNS_FALLBACK_TIMEOUT) -> list:
+    """Minimal stdlib DNS client: query `server` for the IPv4 (A) records of
+    `qname` over UDP (RFC 1035), one attempt, with a hard `timeout`. No
+    `dig`/external dependency. Returns [] on any failure -- timeout,
+    unreachable server, malformed reply, NXDOMAIN, no A records -- never
+    raises to the caller.
+    """
+    try:
+        qid = random.randint(0, 0xFFFF)
+        header = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)  # RD=1, 1 question
+        question = b"".join(
+            struct.pack("B", len(label)) + label.encode("ascii")
+            for label in qname.rstrip(".").split(".")
+        ) + b"\x00" + struct.pack(">HH", 1, 1)  # QTYPE=A, QCLASS=IN
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(timeout)
+            sock.sendto(header + question, (server, 53))
+            data, _ = sock.recvfrom(512)
+    except (OSError, UnicodeEncodeError):
+        return []
+
+    if len(data) < 12 or data[0:2] != struct.pack(">H", qid):
+        return []
+    rcode = data[3] & 0x0F
+    qdcount, ancount = struct.unpack(">HH", data[4:8])
+    if rcode != 0 or ancount == 0:
+        return []
+
+    offset = 12
+    for _ in range(qdcount):
+        offset = _skip_dns_name(data, offset) + 4  # + QTYPE + QCLASS
+
+    ips = []
+    for _ in range(ancount):
+        offset = _skip_dns_name(data, offset)
+        if offset + 10 > len(data):
+            break
+        rtype, rclass, _ttl, rdlength = struct.unpack(">HHIH", data[offset:offset + 10])
+        offset += 10
+        if offset + rdlength > len(data):
+            break
+        if rtype == 1 and rclass == 1 and rdlength == 4:  # A record, IN class
+            ips.append(".".join(str(b) for b in data[offset:offset + 4]))
+        offset += rdlength
+    return sorted(set(ips))
+
+
+def dns_cache_path(cache_dir: Path, host: str) -> Path:
+    """Path of the last-known-good DNS cache file for `host`."""
+    return cache_dir / f"{host}.json"
+
+
+def dns_cache_read(cache_dir: Path, host: str, max_age: float):
+    """Return (ips, resolved_at) for `host` if a cache file exists, parses,
+    and is younger than `max_age` seconds; else None. Never raises."""
+    path = dns_cache_path(cache_dir, host)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+        ips, resolved_at = data.get("ips") or [], data.get("resolved_at") or 0
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not ips or (time.time() - resolved_at) >= max_age:
+        return None
+    return ips, resolved_at
+
+
+def dns_cache_write(cache_dir: Path, host: str, ips: list) -> None:
+    """Persist a successful resolution of `host` as the last-known-good
+    cache, atomically. Best-effort: a write failure is not fatal to the
+    caller's resolution result, just to the cache update."""
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(
+            dns_cache_path(cache_dir, host),
+            json.dumps({"host": host, "ips": ips, "resolved_at": time.time()}),
+        )
+    except OSError as exc:
+        print(f"WARNING: failed to write DNS cache for '{host}': {exc}")
+
+
+def resolve_corp_host(host: str, timeout: float, fallback_dns: str, cache_dir: Path,
+                       refresh: bool, stats: dict):
+    """Resolve one corp-hosts-check.txt entry: system resolver -> public
+    fallback DNS -> last-known-good cache (in that order), updating `stats`
+    with which path supplied the answer. Returns (ips, source) where source
+    is one of "live", "fallback", "cache", "fail".
+
+    The public fallback exists because a corp-hosts-check.txt entry can be a
+    public hostname (hosted outside the corporate network) that is normally
+    excluded from the personal VPN via its resolved /32 -- with the
+    corporate VPN down, /etc/resolver/<zone> routes its lookup at an
+    unreachable corporate server even though a public resolver would answer
+    it fine, so without this fallback its /32 would silently drop out of the
+    exclusion list. Internal-only names legitimately fail both ways; that is
+    not an error, just a WARNING.
+    """
+    ips = resolve_ipv4(host, timeout)
+    if ips:
+        dns_cache_write(cache_dir, host, ips)
+        stats["live"] += 1
+        return ips, "live"
+
+    fallback_ips = dns_query_a(host, fallback_dns, timeout=DNS_FALLBACK_TIMEOUT)
+    if fallback_ips:
+        print(f"INFO: '{host}' resolved via public fallback DNS {fallback_dns} "
+              f"because the corporate resolver was unreachable: {','.join(fallback_ips)}")
+        dns_cache_write(cache_dir, host, fallback_ips)
+        stats["fallback"] += 1
+        return fallback_ips, "fallback"
+
+    if not refresh:
+        cached = dns_cache_read(cache_dir, host, CACHE_AGE_SECONDS)
+        if cached:
+            cached_ips, resolved_at = cached
+            age = time.strftime("%Y-%m-%d %H:%M", time.localtime(resolved_at))
+            print(f"WARNING: '{host}' unreachable via the corporate resolver and the public "
+                  f"fallback -- the corporate VPN tunnel seems to be down; using the last "
+                  f"known addresses from {age}: {','.join(cached_ips)}")
+            stats["cache"] += 1
+            return cached_ips, "cache"
+
+    print(f"WARNING: '{host}' could not be resolved (corporate resolver, public fallback, "
+          f"and cache all failed, are stale, or --refresh was requested)")
+    stats["failed"] += 1
+    return [], "fail"
+
+
+def resolve_direct_domain(domain: str, timeout: float, cache_dir: Path, refresh: bool, stats: dict):
+    """Resolve one direct-domains.txt entry: system resolver -> last-known-
+    good cache (no public fallback -- these must resolve the way the user
+    actually experiences them, via the system resolver). Returns (ips,
+    source) where source is one of "live", "cache", "fail"."""
+    ips = resolve_ipv4(domain, timeout)
+    if ips:
+        dns_cache_write(cache_dir, domain, ips)
+        stats["live"] += 1
+        return ips, "live"
+
+    if not refresh:
+        cached = dns_cache_read(cache_dir, domain, CACHE_AGE_SECONDS)
+        if cached:
+            cached_ips, resolved_at = cached
+            age = time.strftime("%Y-%m-%d %H:%M", time.localtime(resolved_at))
+            print(f"WARNING: '{domain}' failed to resolve; using last known addresses "
+                  f"from {age}: {','.join(cached_ips)}")
+            stats["cache"] += 1
+            return cached_ips, "cache"
+
+    stats["failed"] += 1
+    return [], "fail"
+
+
+def self_test(fallback_dns: str) -> int:
+    """Quick self-test of dns_query_a(): a positive case against a real
+    public resolver and a negative case against a non-routable resolver
+    address that must time out within DNS_FALLBACK_TIMEOUT and never raise."""
+    print("=== --self-test: minimal stdlib DNS client (dns_query_a) ===")
+    ok = True
+
+    print(f"  positive: A query for 'dns.google' via {fallback_dns} ...")
+    start = time.perf_counter()
+    ips = dns_query_a("dns.google", fallback_dns)
+    elapsed = time.perf_counter() - start
+    well_formed = bool(ips) and all(_looks_like_ipv4(ip) for ip in ips)
+    print(f"    result: {ips} ({elapsed:.2f}s)")
+    check_label = "positive case returned a well-formed IPv4 answer"
+    print(f"  [{'PASS' if well_formed else 'FAIL'}] {check_label}")
+    ok = ok and well_formed
+
+    non_routable = "192.0.2.1"  # TEST-NET-1 (RFC 5737): documented, never routable
+    print(f"  negative: A query for 'dns.google' via non-routable {non_routable} ...")
+    start = time.perf_counter()
+    raised = False
+    try:
+        ips2 = dns_query_a("dns.google", non_routable)
+    except Exception as exc:  # noqa: BLE001 - the case under test is "must not raise"
+        raised = True
+        ips2 = None
+        print(f"    raised: {exc!r}")
+    elapsed2 = time.perf_counter() - start
+    within_cap = elapsed2 <= DNS_FALLBACK_TIMEOUT + 1.0  # scheduling slack
+    print(f"    result: {ips2} ({elapsed2:.2f}s, within {DNS_FALLBACK_TIMEOUT}s cap: {within_cap})")
+    negative_ok = (not raised) and ips2 == [] and within_cap
+    check_label = "negative case timed out within the cap and did not raise"
+    print(f"  [{'PASS' if negative_ok else 'FAIL'}] {check_label}")
+    ok = ok and negative_ok
+
+    print()
+    print("Self-test " + ("PASSED" if ok else "FAILED"))
+    return 0 if ok else 1
+
+
+def _looks_like_ipv4(candidate: str) -> bool:
+    try:
+        ipaddress.IPv4Address(candidate)
+        return True
+    except ValueError:
+        return False
 
 
 def http_get_json(url: str) -> dict:
@@ -620,7 +876,37 @@ def main() -> int:
     parser.add_argument(
         "--refresh",
         action="store_true",
-        help="force re-downloading RIPEstat/RIPE caches instead of reusing them",
+        help="force re-downloading RIPEstat/RIPE caches instead of reusing them; "
+             "also skips the last-known-good DNS cache fallback (build/cache/dns/) "
+             "so a stale cache never papers over a live resolution failure",
+    )
+    parser.add_argument(
+        "--resolve-timeout",
+        type=float,
+        default=DEFAULT_RESOLVE_TIMEOUT,
+        metavar="N",
+        help="hard wall-clock cap in seconds for every hostname lookup via the "
+             "system resolver (default: %(default)s). getaddrinfo() has no "
+             "timeout of its own, so a lookup still running after N seconds is "
+             "treated as a failure and abandoned in a background thread -- this "
+             "is what keeps the generator from hanging when a corp-hosts-check.txt "
+             "zone's /etc/resolver DNS server is unreachable (corporate VPN down)",
+    )
+    parser.add_argument(
+        "--fallback-dns",
+        default=DEFAULT_FALLBACK_DNS,
+        metavar="IP",
+        help="public DNS resolver queried (minimal stdlib UDP A-record query, "
+             "%(default)s by default) for corp-hosts-check.txt entries the system "
+             "resolver could not reach -- not used for direct-domains.txt, which "
+             "must resolve the way the user actually experiences it",
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="run a self-test of the minimal stdlib DNS client (dns_query_a) "
+             "against --fallback-dns and a non-routable resolver, print PASS/FAIL, "
+             "and exit -- does not touch --config or build/",
     )
     parser.add_argument(
         "--max-sites",
@@ -643,6 +929,9 @@ def main() -> int:
     if args.max_sites is not None and args.max_sites <= 0:
         parser.error("--max-sites must be a positive integer")
 
+    if args.self_test:
+        return self_test(args.fallback_dns)
+
     config_dir = Path(args.config).resolve() if args.config else (REPO_ROOT / "local")
     if not config_dir.is_dir():
         print(f"ERROR: config dir not found: {config_dir}", file=sys.stderr)
@@ -653,6 +942,7 @@ def main() -> int:
     cache_dir = REPO_ROOT / "build" / "cache"
     ripestat_dir = cache_dir / "ripestat"
     ripencc_path = cache_dir / "delegated-ripencc-extended-latest"
+    dns_cache_dir = cache_dir / "dns"
 
     direct_cidrs_raw = read_list(config_dir / "direct-cidrs.txt")
     domain_specs = read_direct_domains(config_dir / "direct-domains.txt")
@@ -738,8 +1028,18 @@ def main() -> int:
     domain_records = []   # per-domain reporting records
     fallback_count = 0    # domains that had to fall back to IP due to network
 
+    # --- DNS resolution phase (direct-domains.txt + corp-hosts-check.txt) --
+    # Timed and summarized below: this is exactly the phase that used to
+    # hang for minutes when the corporate VPN is down and /etc/resolver/
+    # <zone> points at an unreachable corporate DNS server (see
+    # resolve_ipv4()/resolve_corp_host()).
+    resolution_start = time.perf_counter()
+    resolution_stats = {"live": 0, "fallback": 0, "cache": 0, "failed": 0}
+
     for domain, override in domain_specs:
-        ips = resolve_ipv4(domain)
+        ips, domain_source = resolve_direct_domain(
+            domain, args.resolve_timeout, dns_cache_dir, args.refresh, resolution_stats
+        )
         ip_nets = [ipaddress.ip_network(f"{ip}/32") for ip in ips]
         for ip in ips:
             resolved_direct.append((domain, ip))
@@ -865,13 +1165,43 @@ def main() -> int:
             "mode": mode,
             "n_prefixes": len(asn_prefix_nets),
             "asn_prefixes": asn_prefix_nets,
+            "source": domain_source,
         })
 
-    resolved_corp_hosts = []  # (host, ip)
+    resolved_corp_hosts = []  # (host, ip, source)
+    failed_corp_hosts = []    # hosts that failed live + fallback + cache
     for host in corp_hosts_check:
-        for ip in resolve_ipv4(host):
+        ips, host_source = resolve_corp_host(
+            host, args.resolve_timeout, args.fallback_dns, dns_cache_dir,
+            args.refresh, resolution_stats,
+        )
+        if host_source == "fail":
+            failed_corp_hosts.append(host)
+        for ip in ips:
             exclusions.add(ipaddress.ip_network(f"{ip}/32"))
-            resolved_corp_hosts.append((host, ip))
+            resolved_corp_hosts.append((host, ip, host_source))
+
+    resolution_elapsed = time.perf_counter() - resolution_start
+    print()
+    print(
+        f"Resolution phase took {resolution_elapsed:.2f}s "
+        f"(--resolve-timeout {args.resolve_timeout}s cap per host, "
+        f"{len(domain_specs)} direct-domains.txt + {len(corp_hosts_check)} "
+        f"corp-hosts-check.txt entries)"
+    )
+    print(
+        f"  resolved live: {resolution_stats['live']}, "
+        f"via public fallback: {resolution_stats['fallback']}, "
+        f"via cache: {resolution_stats['cache']}, "
+        f"failed outright: {resolution_stats['failed']}"
+    )
+    if failed_corp_hosts:
+        print(
+            f"WARNING: {len(failed_corp_hosts)} corp-hosts-check.txt host(s) failed to "
+            f"resolve outright ({', '.join(failed_corp_hosts)}) -- their /32 is missing "
+            f"from the exclusion list. Regenerate once with the corporate VPN connected "
+            f"to fill the cache."
+        )
 
     dhcp_ns = dhcp_nameservers()
     for ip in dhcp_ns:
@@ -938,12 +1268,13 @@ def main() -> int:
     print(f"  direct-domains.txt          : {len(domain_records)} domain(s) -> {n_total_resolved} resolved IPv4")
     for r in domain_records:
         print(f"      {r['domain']} -> {','.join(r['ips']) if r['ips'] else '-'} -> {r['asns']} ({r['holder']}) "
-              f"country={r['country']} mode={r['mode']} prefixes={r['n_prefixes']}")
+              f"country={r['country']} mode={r['mode']} prefixes={r['n_prefixes']} source={r['source']}")
     print(f"      modes: {n_asn_mode} domain(s) in asn mode, {n_ip_mode} in ip mode, "
           f"{fallback_count} fell back to ip due to network")
     print(f"  corp-hosts-check.txt        : {len(corp_hosts_check)} host(s) -> {len(resolved_corp_hosts)} resolved IPv4")
-    for host, ip in resolved_corp_hosts:
-        print(f"      {host} -> {ip}")
+    for host, ip, host_source in resolved_corp_hosts:
+        tag = f" [{host_source}]" if host_source != "live" else ""
+        print(f"      {host} -> {ip}{tag}")
     print(f"  DHCP nameservers ({default_interface()}): {len(dhcp_ns)} -> {dhcp_ns}")
     print(f"  direct-dns.txt                : {len(direct_dns)} -> {direct_dns}")
     print(f"  keep-tunneled.txt entries   : {len(parsed_keep_tunneled)} -> "
@@ -1146,7 +1477,7 @@ def main() -> int:
     # that exclusion path (config-driven, no hostname hardcoded here -- see
     # resolved_corp_hosts, built from corp-hosts-check.txt).
     if resolved_corp_hosts:
-        for host, ip in resolved_corp_hosts:
+        for host, ip, _host_source in resolved_corp_hosts:
             check(f"corp-hosts-check.txt host {host} ({ip}) goes direct (not tunneled)",
                   goes_direct(ip))
     else:
