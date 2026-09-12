@@ -34,12 +34,51 @@
 #   3. WARN -- the primary interface has a global (non-fe80:) IPv6 address
 #      while the personal utun is up: the exclusion list is IPv4-only, so
 #      IPv6 traffic bypasses it straight into the personal tunnel.
-#   4. WARN -- the site list file for the current mode is older than
-#      --stale-days (default 30).
-#   5. WARN -- the primary network service's first DNS server is a
+#   4. WARN -- the primary network service's first DNS server is a
 #      corporate one from corp-dns.txt -- the same condition dns-guard.sh
 #      intervenes on; this only reports, it never calls networksetup.
-#   6. INFO -- corporate/personal utun presence and route counts.
+#   5. INFO -- corporate/personal utun presence and route counts.
+#
+# Drift detection (checks 5a/5b/5c below) replaces the old "list not
+# regenerated in 30 days" timer as the primary signal -- that timer is kept
+# as check 5d, lowest priority, because "not regenerated in a while" is only
+# ever a proxy for the three real symptoms/causes below:
+#   5a. SYMPTOM_LIVE, every tick, bounded to ~30s total -- resolves every
+#       direct-domains.txt domain and every corp-hosts-check.txt host that
+#       resolves to a public address RIGHT NOW (short DNS timeout, see
+#       below) and checks each resolved IPv4 against the generated file for
+#       the current MODE: must NOT be covered by build/.../amnezia-sites.txt
+#       in forward mode, must BE covered by build/.../amnezia-exclude.txt in
+#       exclude mode. A miss means that address is tunneled through the
+#       personal VPN right now even though it must not be -- WARN. Caches
+#       nothing (must reflect live state); if resolution is failing broadly
+#       (no network), reports INFO instead of flooding WARNs.
+#   5b. REGISTRY_DIFF, at most once every 7 days (persisted in STATE_DIR) --
+#       runs gen-amnezia-sites.py in the background with --refresh and
+#       --dry-run-output (a temp file, build/ untouched) for the current
+#       MODE, so RIPEstat/RIPE NCC data is re-fetched, then diffs that
+#       against the currently generated file and WARNs with +added/-removed
+#       network counts on any difference. This is the check that catches an
+#       ISP/company changing its announced prefixes, which 5a cannot see
+#       (5a only checks addresses already known to matter, not the ASN's
+#       announced-prefix set as a whole). Bounded to 420s (measured: a real
+#       --refresh run against ~30 direct-domains.txt entries took 3m51s); a
+#       timeout or generator failure reports INFO, not WARN, and still
+#       counts as this week's attempt.
+#   5c. IMPORT_MISMATCH, every tick -- compares the generated file for the
+#       current MODE against what AmneziaVPN currently has imported, read
+#       read-only from ~/Library/Preferences/org.amneziavpn.AmneziaVPN.plist
+#       (Conf.ForwardSites in forward mode, Conf.ExceptSites in exclude
+#       mode -- see client/settings.cpp's routeModeString()/vpnSites() in
+#       the AmneziaVPN source). WARNs with +added/-removed network counts
+#       (never hostnames/CIDRs) on any difference -- this is the check that
+#       catches "regenerated but forgot to reimport", which neither 5a nor
+#       5b can see. Only that one key is ever read; Servers.serversList
+#       (encrypted server config) is never touched or printed.
+#   5d. STALE, WARN -- the site list file for the current mode is older
+#       than --stale-days (default 30). Lowest priority: a fresh list can
+#       still be wrong (5b/5c) and a stale list can still be accurate, but
+#       an untouched-for-months list is still worth a nudge on its own.
 #
 # Notification policy (see also README): a Telegram message is sent only on
 # a state transition of one check (OK->FAIL, FAIL->OK, OK->WARN, WARN->OK,
@@ -52,13 +91,21 @@
 # and "comrades-tunnel-telegram-bot-chat", both `-a "$USER"`. They are
 # never printed or logged.
 #
+# Build output is namespaced per --config (see gen-amnezia-sites.py): the
+# default local/ writes to build/, anything else writes to
+# build/<config-dir-basename>/. This script resolves the same BUILD_DIR so
+# SITES_FILE (used by checks 5a/5b/5d) always points at the file the active
+# --config actually produced.
+#
 # Usage: split-health.sh [--config DIR] [--gateway-mode {direct,tunnel}]
-#                         [--stale-days N] [--dry-run] [--status] [--test-telegram]
+#                         [--stale-days N] [--dry-run] [--status]
+#                         [--test-telegram] [--self-test]
 # With no mode flag, this performs a real run: checks, updates state,
 # sends Telegram per the policy above, and appends one log line. Exit code
 # is always 0 in that mode (a LaunchAgent tick must never look like a
 # crash); --dry-run/--status/--test-telegram also exit 0 except on a usage
-# error (2).
+# error (2). --self-test runs fully offline against synthetic data (no
+# network, no real config/plist) and exits 0 only if every case PASSes.
 
 set -u
 
@@ -74,6 +121,7 @@ STALE_DAYS=30
 DRY_RUN=0
 STATUS=0
 TEST_TELEGRAM=0
+SELF_TEST=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -86,8 +134,9 @@ while [ $# -gt 0 ]; do
         --dry-run) DRY_RUN=1; shift ;;
         --status) STATUS=1; shift ;;
         --test-telegram) TEST_TELEGRAM=1; shift ;;
+        --self-test) SELF_TEST=1; shift ;;
         *)
-            echo "Usage: $0 [--config DIR] [--gateway-mode {direct,tunnel}] [--stale-days N] [--dry-run] [--status] [--test-telegram]" >&2
+            echo "Usage: $0 [--config DIR] [--gateway-mode {direct,tunnel}] [--stale-days N] [--dry-run] [--status] [--test-telegram] [--self-test]" >&2
             exit 2
             ;;
     esac
@@ -163,6 +212,195 @@ if [ "$TEST_TELEGRAM" = 1 ]; then
     exit 0
 fi
 
+# --- helpers for the three drift-detection checks (5a/5b/5c, see header) ---
+
+# ip_covered_by_file IP FILE -- prints 1 if IP falls inside any CIDR line of
+# FILE (one CIDR/host per line, '#' comments allowed), else 0. A missing
+# FILE counts as "covers nothing". python3 stdlib ipaddress; used by
+# SYMPTOM_LIVE (a few dozen calls per tick, each fast: one interpreter
+# startup plus a linear scan of FILE) and by --self-test.
+ip_covered_by_file() {
+    ip=$1
+    file=$2
+    if [ ! -f "$file" ]; then
+        echo 0
+        return
+    fi
+    python3 -c '
+import ipaddress, sys
+ip = ipaddress.ip_address(sys.argv[1])
+covered = 0
+try:
+    with open(sys.argv[2]) as fh:
+        for line in fh:
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            try:
+                net = ipaddress.ip_network(line, strict=False)
+            except ValueError:
+                continue
+            if ip in net:
+                covered = 1
+                break
+except OSError:
+    pass
+print(covered)
+' "$ip" "$file"
+}
+
+# is_private_ipv4 IP -- true (0) for RFC 1918 private ranges (10/8,
+# 172.16/12, 192.168/16); same case-pattern as check-split.sh's is_rfc1918
+# (duplicated, not sourced -- see this script's own note on small helpers
+# above). Used by SYMPTOM_LIVE to decide whether a resolved
+# corp-hosts-check.txt address is public (checkable against the generated
+# file) or internal (handled by the corporate tunnel, not this check).
+is_private_ipv4() {
+    case "$1" in
+        10.*) return 0 ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+        192.168.*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# net_diff_counts FILE_A FILE_B FORMAT_B -- prints "ADDED REMOVED A_COUNT
+# B_COUNT" for the symmetric difference between two CIDR sets. FILE_A is
+# always one CIDR per line. FILE_B is the same when FORMAT_B is "lines", or
+# a JSON object whose KEYS are CIDRs when FORMAT_B is "json" (AmneziaVPN
+# stores each imported site as a hostname/CIDR key with its resolved ip --
+# often empty for our own generated entries -- as the value; see
+# SitesController::importSites() in the AmneziaVPN client source). ADDED is
+# present in FILE_A but not FILE_B; REMOVED is the reverse. A missing or
+# unparseable file on either side counts as an empty set, never an error.
+# Shared by REGISTRY_DIFF (lines vs. lines), IMPORT_MISMATCH (lines vs. the
+# plist's JSON export), and --self-test (both, entirely offline).
+net_diff_counts() {
+    python3 -c '
+import ipaddress, json, sys
+
+def normalize(items):
+    out = set()
+    for item in items:
+        try:
+            out.add(str(ipaddress.ip_network(item, strict=False)))
+        except ValueError:
+            continue
+    return out
+
+def read_lines_set(path):
+    try:
+        with open(path) as fh:
+            return normalize(line.strip() for line in fh if line.strip())
+    except OSError:
+        return set()
+
+def read_json_keys_set(path):
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return set()
+    return normalize(data.keys()) if isinstance(data, dict) else set()
+
+a = read_lines_set(sys.argv[1])
+b = read_json_keys_set(sys.argv[2]) if sys.argv[3] == "json" else read_lines_set(sys.argv[2])
+added = a - b
+removed = b - a
+print(len(added), len(removed), len(a), len(b))
+' "$1" "$2" "$3"
+}
+
+# import_mismatch_diff GEN_FILE MODE_KEY -- prints "ADDED REMOVED GEN_COUNT
+# IMP_COUNT" comparing GEN_FILE against what AmneziaVPN currently has
+# imported under the literal top-level plist key "Conf.<MODE_KEY>" in
+# ~/Library/Preferences/org.amneziavpn.AmneziaVPN.plist. MODE_KEY is
+# "ForwardSites" for --mode forward or "ExceptSites" for --mode exclude --
+# see Settings::routeModeString()/vpnSites()/getVpnIps() in
+# client/settings.cpp of the AmneziaVPN source: QSettings groups map "/" to
+# "." on macOS's native (CFPreferences) format, so "Conf/ForwardSites"
+# becomes the single top-level key "Conf.ForwardSites", confirmed against
+# this machine's real plist. `defaults read DOMAIN "Conf.<MODE_KEY>"`
+# extracts ONLY that one key as an old-style NeXTSTEP property list (a
+# whole-file `plutil -convert json` fails on this plist because
+# Servers.serversList holds NSData -- the encrypted per-server config --
+# which JSON cannot represent); `plutil -convert json` then turns that
+# single extracted key into JSON for net_diff_counts. Servers.serversList
+# and Servers.defaultServerIndex are never read, converted, or printed at
+# any point. A missing plist, missing key (e.g. exclude mode never used
+# yet), or absent AmneziaVPN install is treated as "nothing imported"
+# (IMP_COUNT=0), not an error.
+import_mismatch_diff() {
+    gen_file=$1
+    mode_key=$2
+    plist="$HOME/Library/Preferences/org.amneziavpn.AmneziaVPN.plist"
+    nextstep=$(mktemp)
+    imp_json=$(mktemp)
+    echo '{}' >"$imp_json"
+    if [ -f "$plist" ] && defaults read org.amneziavpn.AmneziaVPN "Conf.$mode_key" >"$nextstep" 2>/dev/null; then
+        plutil -convert json -o "$imp_json" "$nextstep" 2>/dev/null || echo '{}' >"$imp_json"
+    fi
+    net_diff_counts "$gen_file" "$imp_json" json
+    rm -f "$nextstep" "$imp_json"
+}
+
+if [ "$SELF_TEST" = 1 ]; then
+    echo "=== split-health.sh --self-test (offline: synthetic data only, no network/config/plist) ==="
+    ST_OK=1
+    ST_TMPDIR=$(mktemp -d)
+
+    st_check() {   # st_check LABEL RESULT(0=pass)
+        if [ "$2" = 0 ]; then
+            echo "  [PASS] $1"
+        else
+            echo "  [FAIL] $1"
+            ST_OK=0
+        fi
+    }
+
+    # --- (a) SYMPTOM_LIVE: covered / not-covered against a synthetic list ---
+    printf '10.0.0.0/8\n1.2.3.0/24\n' >"$ST_TMPDIR/sites.txt"
+    st_covered=$(ip_covered_by_file "1.2.3.4" "$ST_TMPDIR/sites.txt")
+    st_check "(a) 1.2.3.4 reported covered by a synthetic list containing 1.2.3.0/24" \
+        "$([ "$st_covered" = 1 ] && echo 0 || echo 1)"
+    st_not_covered=$(ip_covered_by_file "8.8.8.8" "$ST_TMPDIR/sites.txt")
+    st_check "(a) 8.8.8.8 reported NOT covered by the same synthetic list" \
+        "$([ "$st_not_covered" = 0 ] && echo 0 || echo 1)"
+
+    # --- (b) REGISTRY_DIFF: diff detected between two synthetic lists ---
+    printf '5.6.7.0/24\n8.9.10.0/24\n' >"$ST_TMPDIR/old.txt"
+    printf '5.6.7.0/24\n11.12.13.0/24\n' >"$ST_TMPDIR/new.txt"
+    set -- $(net_diff_counts "$ST_TMPDIR/old.txt" "$ST_TMPDIR/new.txt" lines)
+    st_check "(b) synthetic diff detects +1 added / -1 removed network" \
+        "$([ "$1" = 1 ] && [ "$2" = 1 ] && echo 0 || echo 1)"
+    set -- $(net_diff_counts "$ST_TMPDIR/old.txt" "$ST_TMPDIR/old.txt" lines)
+    st_check "(b) identical synthetic lists show no diff" \
+        "$([ "$1" = 0 ] && [ "$2" = 0 ] && echo 0 || echo 1)"
+
+    # --- (c) IMPORT_MISMATCH: matching and mismatching synthetic sets ---
+    # (net_diff_counts directly, not import_mismatch_diff -- the real plist
+    # is never touched in --self-test, per its own requirement.)
+    printf '1.2.3.0/24\n4.5.6.0/24\n' >"$ST_TMPDIR/gen.txt"
+    printf '{"1.2.3.0/24": "", "4.5.6.0/24": ""}' >"$ST_TMPDIR/imp_match.json"
+    printf '{"1.2.3.0/24": "", "9.9.9.0/24": ""}' >"$ST_TMPDIR/imp_mismatch.json"
+    set -- $(net_diff_counts "$ST_TMPDIR/gen.txt" "$ST_TMPDIR/imp_match.json" json)
+    st_check "(c) matching synthetic sets show no diff" \
+        "$([ "$1" = 0 ] && [ "$2" = 0 ] && echo 0 || echo 1)"
+    set -- $(net_diff_counts "$ST_TMPDIR/gen.txt" "$ST_TMPDIR/imp_mismatch.json" json)
+    st_check "(c) mismatching synthetic sets show +1 added / -1 removed" \
+        "$([ "$1" = 1 ] && [ "$2" = 1 ] && echo 0 || echo 1)"
+
+    rm -rf "$ST_TMPDIR"
+    echo
+    if [ "$ST_OK" = 1 ]; then
+        echo "Self-test PASSED"
+        exit 0
+    else
+        echo "Self-test FAILED"
+        exit 1
+    fi
+fi
+
 # --- per-check state, KEY=VALUE files under STATE_DIR, read with grep/cut
 # only (never sourced/eval'd) -- same discipline as every other config file
 # in this repo.
@@ -203,9 +441,27 @@ case "$MODE" in
         ;;
 esac
 
+# --- build output is namespaced per --config (see gen-amnezia-sites.py's
+# module docstring): the default local/ writes to build/, anything else
+# writes to build/<config-dir-basename>/. Resolve CONFIG_DIR to an absolute
+# path first (same "relative is relative to REPO_ROOT" convention
+# install-split-health.sh already uses) so the comparison against
+# REPO_ROOT/local is exact regardless of how --config was spelled. ---
+case "$CONFIG_DIR" in
+    /*) CONFIG_DIR_ABS=$CONFIG_DIR ;;
+    *) CONFIG_DIR_ABS="$REPO_ROOT/$CONFIG_DIR" ;;
+esac
+[ -d "$CONFIG_DIR_ABS" ] && CONFIG_DIR_ABS=$(cd "$CONFIG_DIR_ABS" && pwd)
+
+if [ "$CONFIG_DIR_ABS" = "$REPO_ROOT/local" ]; then
+    BUILD_DIR="$REPO_ROOT/build"
+else
+    BUILD_DIR="$REPO_ROOT/build/$(basename "$CONFIG_DIR_ABS")"
+fi
+
 case "$MODE" in
-    forward) SITES_FILE="$REPO_ROOT/build/amnezia-sites.txt" ;;
-    exclude) SITES_FILE="$REPO_ROOT/build/amnezia-exclude.txt" ;;
+    forward) SITES_FILE="$BUILD_DIR/amnezia-sites.txt" ;;
+    exclude) SITES_FILE="$BUILD_DIR/amnezia-exclude.txt" ;;
 esac
 
 # --- detect the two VPN utun interfaces (see lib-routes.sh) ---
@@ -308,7 +564,8 @@ if [ -n "$PRIMARY_IFACE" ] && [ -n "$AMNEZIA_UTUN" ]; then
 fi
 
 # =========================================================================
-# Check 4 -- WARN: generated site list for current MODE is stale
+# Check STALE (5d in the header's drift-detection family, lowest priority) --
+# WARN: generated site list for current MODE is stale
 # =========================================================================
 STALE_STATUS=OK
 if [ ! -f "$SITES_FILE" ]; then
@@ -326,7 +583,8 @@ else
 fi
 
 # =========================================================================
-# Check 5 -- WARN: primary service's DNS list starts with a corporate server
+# Check DNS_CLOBBER (4 in the header) -- WARN: primary service's DNS list
+# starts with a corporate server
 # =========================================================================
 DNS_SERVICE=""
 if [ -n "$PRIMARY_IFACE" ]; then
@@ -359,7 +617,7 @@ fi
 # Notification decision: shared by --dry-run (read-only preview) and the
 # real run (writes state + sends). ID list kept in one place for --status.
 # =========================================================================
-CHECK_IDS="CORP_LEAK SPLIT_ABSENT IPV6 STALE DNS_CLOBBER"
+CHECK_IDS="CORP_LEAK SPLIT_ABSENT IPV6 STALE DNS_CLOBBER SYMPTOM_LIVE REGISTRY_DIFF IMPORT_MISMATCH"
 
 check_label() {
     case "$1" in
@@ -368,6 +626,9 @@ check_label() {
         IPV6) echo "глобальный IPv6 обходит исключения" ;;
         STALE) echo "список сайтов устарел" ;;
         DNS_CLOBBER) echo "DNS основного сервиса подменён" ;;
+        SYMPTOM_LIVE) echo "живой адрес идёт через личный VPN вопреки списку" ;;
+        REGISTRY_DIFF) echo "сверка с реестром RIPEstat/RIPE показала изменения" ;;
+        IMPORT_MISMATCH) echo "сгенерированный список расходится с импортированным в Amnezia" ;;
     esac
 }
 
@@ -424,6 +685,196 @@ if [ "$STATUS" = 1 ]; then
     exit 0
 fi
 
+# =========================================================================
+# Check SYMPTOM_LIVE (5a) -- WARN: a direct-domains.txt domain, or a public
+# corp-hosts-check.txt address, resolves RIGHT NOW to an IPv4 that the
+# generated file for the current MODE does not (yet) handle correctly.
+# Deliberately skipped for --status above (DNS resolution here can take up
+# to SYMPTOM_BUDGET_SECONDS) so `make health-status` stays fast; --dry-run
+# and a real run both compute it for real, per SITES_FILE (already
+# namespaced per --config, see above).
+# =========================================================================
+SYMPTOM_BUDGET_SECONDS=25
+SYMPTOM_START=$(date +%s)
+SYMPTOM_ATTEMPTED=0
+SYMPTOM_RESOLVED=0
+SYMPTOM_VIOLATIONS=0
+SYMPTOM_SKIPPED=0
+SYMPTOM_TABLE=""
+SYMPTOM_LAST_MISS=""
+
+symptom_budget_left() {
+    [ $(( $(date +%s) - SYMPTOM_START )) -lt "$SYMPTOM_BUDGET_SECONDS" ]
+}
+
+# symptom_check_host HOST PUBLIC_ONLY -- resolves HOST with the same
+# `dig +time=2 +tries=1` convention check 1 already uses in this script,
+# then (if PUBLIC_ONLY=1, only for public addresses -- corp-hosts-check.txt
+# may legitimately resolve to an internal RFC1918 address, which is not
+# this check's concern) tests coverage against SITES_FILE for the active
+# MODE via ip_covered_by_file.
+symptom_check_host() {
+    host=$1
+    public_only=$2
+    ip=$(dig +short +time=2 +tries=1 A "$host" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+    SYMPTOM_ATTEMPTED=$((SYMPTOM_ATTEMPTED + 1))
+    [ -z "$ip" ] && return
+    if [ "$public_only" = 1 ] && is_private_ipv4 "$ip"; then
+        return
+    fi
+    SYMPTOM_RESOLVED=$((SYMPTOM_RESOLVED + 1))
+    covered=$(ip_covered_by_file "$ip" "$SITES_FILE")
+    if [ "$MODE" = "exclude" ]; then
+        ok=$([ "$covered" = 1 ] && echo 1 || echo 0)
+    else
+        ok=$([ "$covered" = 0 ] && echo 1 || echo 0)
+    fi
+    result="OK"
+    if [ "$ok" != 1 ]; then
+        result="MISS"
+        SYMPTOM_VIOLATIONS=$((SYMPTOM_VIOLATIONS + 1))
+        SYMPTOM_LAST_MISS="домен/хост $host ($ip) сейчас идёт через личный VPN, перегенерируйте и переимпортируйте список"
+    fi
+    SYMPTOM_TABLE="${SYMPTOM_TABLE}$(printf '  %-42s %-16s %s' "$host" "$ip" "$result")${NL}"
+}
+
+DIRECT_DOMAINS_TMP=$(mktemp)
+read_lines "$CONFIG_DIR/direct-domains.txt" >"$DIRECT_DOMAINS_TMP"
+DIRECT_DOMAINS_TOTAL=$(grep -c . "$DIRECT_DOMAINS_TMP" 2>/dev/null || echo 0)
+DIRECT_DOMAINS_SEEN=0
+while IFS= read -r line; do
+    domain=${line%% *}
+    [ -z "$domain" ] && continue
+    DIRECT_DOMAINS_SEEN=$((DIRECT_DOMAINS_SEEN + 1))
+    if ! symptom_budget_left; then
+        SYMPTOM_SKIPPED=$((SYMPTOM_SKIPPED + DIRECT_DOMAINS_TOTAL - DIRECT_DOMAINS_SEEN + 1))
+        break
+    fi
+    symptom_check_host "$domain" 0
+done <"$DIRECT_DOMAINS_TMP"
+rm -f "$DIRECT_DOMAINS_TMP"
+
+CORP_HOSTS_TMP=$(mktemp)
+read_lines "$CONFIG_DIR/corp-hosts-check.txt" >"$CORP_HOSTS_TMP"
+CORP_HOSTS_TOTAL=$(grep -c . "$CORP_HOSTS_TMP" 2>/dev/null || echo 0)
+CORP_HOSTS_SEEN=0
+while IFS= read -r host; do
+    [ -z "$host" ] && continue
+    CORP_HOSTS_SEEN=$((CORP_HOSTS_SEEN + 1))
+    if ! symptom_budget_left; then
+        SYMPTOM_SKIPPED=$((SYMPTOM_SKIPPED + CORP_HOSTS_TOTAL - CORP_HOSTS_SEEN + 1))
+        break
+    fi
+    symptom_check_host "$host" 1
+done <"$CORP_HOSTS_TMP"
+rm -f "$CORP_HOSTS_TMP"
+
+SYMPTOM_SKIPPED_NOTE=""
+[ "$SYMPTOM_SKIPPED" -gt 0 ] && SYMPTOM_SKIPPED_NOTE=" (бюджет времени исчерпан, $SYMPTOM_SKIPPED не проверено в этом тике)"
+
+if [ "$SYMPTOM_ATTEMPTED" -eq 0 ]; then
+    SYMPTOM_LIVE_STATUS=OK
+    SYMPTOM_LIVE_EVIDENCE="нет доменов/хостов для живой проверки"
+elif [ "$SYMPTOM_RESOLVED" -eq 0 ] && [ "$SYMPTOM_ATTEMPTED" -ge 3 ]; then
+    SYMPTOM_LIVE_STATUS=INFO
+    SYMPTOM_LIVE_EVIDENCE="живая проверка не смогла резолвить ни один из $SYMPTOM_ATTEMPTED адресов (сети нет?) -- пропущено в этом тике$SYMPTOM_SKIPPED_NOTE"
+elif [ "$SYMPTOM_VIOLATIONS" -gt 0 ]; then
+    SYMPTOM_LIVE_STATUS=WARN
+    SYMPTOM_LIVE_EVIDENCE="$SYMPTOM_LAST_MISS (всего проблемных: $SYMPTOM_VIOLATIONS из $SYMPTOM_RESOLVED резолвленных)$SYMPTOM_SKIPPED_NOTE"
+else
+    SYMPTOM_LIVE_STATUS=OK
+    SYMPTOM_LIVE_EVIDENCE="проверено вживую $SYMPTOM_RESOLVED адрес(ов) из $SYMPTOM_ATTEMPTED, утечек через личный VPN не найдено (режим $MODE)$SYMPTOM_SKIPPED_NOTE"
+fi
+
+# =========================================================================
+# Check REGISTRY_DIFF (5b) -- WARN: re-fetching RIPEstat/RIPE NCC data for
+# the current MODE and regenerating (dry-run, build/ untouched) produces a
+# different network list than what is currently generated. At most once
+# every 7 days (persisted in STATE_DIR); a timeout/failure reports INFO and
+# still counts as this cycle's attempt so a persistent outage does not
+# retry every single tick. Also deliberately skipped for --status (this can
+# take up to REGISTRY_DIFF_TIMEOUT_SECONDS on a real run).
+# =========================================================================
+REGISTRY_DIFF_LAST_RUN_FILE="$STATE_DIR/registry-diff-last-run"
+REGISTRY_DIFF_INTERVAL_SECONDS=$((7 * 24 * 3600))
+REGISTRY_DIFF_TIMEOUT_SECONDS=420
+REGISTRY_DIFF_LAST_RUN=0
+[ -f "$REGISTRY_DIFF_LAST_RUN_FILE" ] && REGISTRY_DIFF_LAST_RUN=$(cat "$REGISTRY_DIFF_LAST_RUN_FILE" 2>/dev/null)
+case "$REGISTRY_DIFF_LAST_RUN" in ''|*[!0-9]*) REGISTRY_DIFF_LAST_RUN=0 ;; esac
+REGISTRY_DIFF_DUE=0
+[ $(( NOW - REGISTRY_DIFF_LAST_RUN )) -ge "$REGISTRY_DIFF_INTERVAL_SECONDS" ] && REGISTRY_DIFF_DUE=1
+REGISTRY_DIFF_DID_RUN=0
+
+if [ "$REGISTRY_DIFF_DUE" = 1 ]; then
+    REGISTRY_DIFF_DID_RUN=1
+    RD_TMP_LIST=$(mktemp)
+    RD_GEN_LOG=$(mktemp)
+    RD_START=$(date +%s)
+    python3 "$SCRIPT_DIR/gen-amnezia-sites.py" --config "$CONFIG_DIR_ABS" --mode "$MODE" \
+        --refresh --dry-run-output "$RD_TMP_LIST" >"$RD_GEN_LOG" 2>&1 &
+    RD_PID=$!
+    ( sleep "$REGISTRY_DIFF_TIMEOUT_SECONDS"; kill -TERM "$RD_PID" 2>/dev/null ) &
+    RD_WATCHDOG=$!
+    wait "$RD_PID" 2>/dev/null
+    RD_RC=$?
+    kill "$RD_WATCHDOG" 2>/dev/null
+    wait "$RD_WATCHDOG" 2>/dev/null
+    RD_ELAPSED=$(( $(date +%s) - RD_START ))
+
+    if [ "$RD_RC" -ne 0 ] || [ ! -s "$RD_TMP_LIST" ]; then
+        REGISTRY_DIFF_STATUS=INFO
+        REGISTRY_DIFF_EVIDENCE="сверка с реестром RIPEstat/RIPE не выполнена (генератор завершился с кодом $RD_RC за ${RD_ELAPSED}с, возможно нет сети или таймаут ${REGISTRY_DIFF_TIMEOUT_SECONDS}с) -- следующая попытка через 7 дней"
+    else
+        set -- $(net_diff_counts "$SITES_FILE" "$RD_TMP_LIST" lines)
+        RD_ADDED=$1
+        RD_REMOVED=$2
+        if [ "$RD_ADDED" -eq 0 ] 2>/dev/null && [ "$RD_REMOVED" -eq 0 ] 2>/dev/null; then
+            REGISTRY_DIFF_STATUS=OK
+            REGISTRY_DIFF_EVIDENCE="сверка с реестром (--refresh, режим $MODE) изменений не показала (${RD_ELAPSED}с)"
+        else
+            REGISTRY_DIFF_STATUS=WARN
+            REGISTRY_DIFF_EVIDENCE="сверка с реестром показала изменения: +$RD_ADDED/-$RD_REMOVED сетей относительно $SITES_FILE (${RD_ELAPSED}с) -- перегенерируйте и переимпортируйте список"
+        fi
+    fi
+    rm -f "$RD_TMP_LIST" "$RD_GEN_LOG"
+else
+    REGISTRY_DIFF_STATUS=$(state_read REGISTRY_DIFF STATUS)
+    REGISTRY_DIFF_EVIDENCE=$(state_read REGISTRY_DIFF EVIDENCE)
+    [ -z "$REGISTRY_DIFF_STATUS" ] && REGISTRY_DIFF_STATUS=OK
+    [ -z "$REGISTRY_DIFF_EVIDENCE" ] && REGISTRY_DIFF_EVIDENCE="сверка с реестром ещё не выполнялась"
+    if [ "$REGISTRY_DIFF_LAST_RUN" = 0 ]; then
+        REGISTRY_DIFF_EVIDENCE="$REGISTRY_DIFF_EVIDENCE (ни разу не выполнялась; раз в 7 дней)"
+    else
+        RD_AGE_DAYS=$(( (NOW - REGISTRY_DIFF_LAST_RUN) / 86400 ))
+        REGISTRY_DIFF_EVIDENCE="$REGISTRY_DIFF_EVIDENCE (последняя проверка ${RD_AGE_DAYS}д назад; раз в 7 дней)"
+    fi
+fi
+
+# =========================================================================
+# Check IMPORT_MISMATCH (5c) -- WARN: the generated file for the current
+# MODE differs from what AmneziaVPN currently has imported (read read-only
+# from its plist, see import_mismatch_diff() above). Cheap (one `defaults
+# read` + one python3 diff), so this runs every tick including --dry-run;
+# deliberately still skipped for --status above, for uniformity with the
+# other two drift checks.
+# =========================================================================
+case "$MODE" in
+    forward) IMPORT_MODE_KEY="ForwardSites" ;;
+    exclude) IMPORT_MODE_KEY="ExceptSites" ;;
+esac
+set -- $(import_mismatch_diff "$SITES_FILE" "$IMPORT_MODE_KEY")
+IMPORT_ADDED=$1
+IMPORT_REMOVED=$2
+IMPORT_GEN_COUNT=$3
+IMPORT_IMP_COUNT=$4
+if [ "$IMPORT_ADDED" -eq 0 ] 2>/dev/null && [ "$IMPORT_REMOVED" -eq 0 ] 2>/dev/null; then
+    IMPORT_MISMATCH_STATUS=OK
+    IMPORT_MISMATCH_EVIDENCE="сгенерированный список (Conf.$IMPORT_MODE_KEY, $IMPORT_GEN_COUNT сетей) совпадает с импортированным в Amnezia ($IMPORT_IMP_COUNT сетей)"
+else
+    IMPORT_MISMATCH_STATUS=WARN
+    IMPORT_MISMATCH_EVIDENCE="сгенерированный список отличается от импортированного в Amnezia: +$IMPORT_ADDED/-$IMPORT_REMOVED сетей -- переимпортируйте"
+fi
+
 print_table() {   # shared by --dry-run and the real run's own echo to stdout
     echo "Config dir: $CONFIG_DIR"
     echo "Gateway mode: $GATEWAY_MODE   Split mode (from $MODE_FILE): $MODE   Stale threshold: ${STALE_DAYS}d"
@@ -461,6 +912,21 @@ print_table() {   # shared by --dry-run and the real run's own echo to stdout
     echo
     echo "=== check 5: DNS clobbered ==="
     echo "  [$DNS_CLOBBER_STATUS] $DNS_CLOBBER_EVIDENCE"
+    echo
+    echo "=== check 5a: live symptom -- direct-domains.txt/corp-hosts-check.txt vs $SITES_FILE ==="
+    printf '  %-42s %-16s %s\n' "HOST" "IP" "RESULT"
+    if [ -n "$SYMPTOM_TABLE" ]; then
+        printf '%b' "$SYMPTOM_TABLE"
+    else
+        echo "  (nothing resolved this tick)"
+    fi
+    echo "  [$SYMPTOM_LIVE_STATUS] $SYMPTOM_LIVE_EVIDENCE"
+    echo
+    echo "=== check 5b: registry diff -- RIPEstat/RIPE NCC re-fetch vs $SITES_FILE (at most once/7d) ==="
+    echo "  [$REGISTRY_DIFF_STATUS] $REGISTRY_DIFF_EVIDENCE"
+    echo
+    echo "=== check 5c: generated vs imported -- Conf.$IMPORT_MODE_KEY in AmneziaVPN's plist ==="
+    echo "  [$IMPORT_MISMATCH_STATUS] $IMPORT_MISMATCH_EVIDENCE"
 }
 
 status_of() {   # status_of CHECKID -- current run's computed status
@@ -470,6 +936,9 @@ status_of() {   # status_of CHECKID -- current run's computed status
         IPV6) echo "$IPV6_STATUS" ;;
         STALE) echo "$STALE_STATUS" ;;
         DNS_CLOBBER) echo "$DNS_CLOBBER_STATUS" ;;
+        SYMPTOM_LIVE) echo "$SYMPTOM_LIVE_STATUS" ;;
+        REGISTRY_DIFF) echo "$REGISTRY_DIFF_STATUS" ;;
+        IMPORT_MISMATCH) echo "$IMPORT_MISMATCH_STATUS" ;;
     esac
 }
 
@@ -480,6 +949,9 @@ evidence_of() {   # evidence_of CHECKID -- current run's computed evidence
         IPV6) echo "$IPV6_EVIDENCE" ;;
         STALE) echo "$STALE_EVIDENCE" ;;
         DNS_CLOBBER) echo "$DNS_CLOBBER_EVIDENCE" ;;
+        SYMPTOM_LIVE) echo "$SYMPTOM_LIVE_EVIDENCE" ;;
+        REGISTRY_DIFF) echo "$REGISTRY_DIFF_EVIDENCE" ;;
+        IMPORT_MISMATCH) echo "$IMPORT_MISMATCH_EVIDENCE" ;;
     esac
 }
 
@@ -521,6 +993,14 @@ for id in $CHECK_IDS; do
     state_write "$id" "$st" "$ev" "$fail_notify"
     LOG_PARTS="${LOG_PARTS}${id}=${st} "
 done
+
+# REGISTRY_DIFF's 7-day gate is persisted only on a real run that actually
+# invoked the generator this tick (see the check's own comment above) --
+# never in --dry-run, so re-running --dry-run does not consume the budget.
+if [ "$REGISTRY_DIFF_DID_RUN" = 1 ]; then
+    mkdir -p "$STATE_DIR"
+    printf '%s\n' "$NOW" >"$REGISTRY_DIFF_LAST_RUN_FILE" 2>/dev/null
+fi
 
 LOG_LINE="$(date '+%Y-%m-%dT%H:%M:%S%z') ${LOG_PARTS}MODE=${MODE} CP_UTUN=${CP_UTUN:-none}(${CP_ROUTES}) AMNEZIA_UTUN=${AMNEZIA_UTUN:-none}(${AMNEZIA_ROUTES})"
 mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null

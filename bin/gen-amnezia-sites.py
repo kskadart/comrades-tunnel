@@ -68,9 +68,19 @@ amnezia-vpn/amnezia-client, client/core/controllers/ipSplitTunnelingController.c
     --mode exclude:
         build/amnezia-exclude.json  -- same JSON shape, one entry per excluded network
         build/amnezia-exclude.txt   -- one CIDR per line, for human review
+  The paths above are exactly right for the default config (local/, or no
+  --config at all). Passing --config anywhere else (e.g. config/example)
+  writes the very same four filenames under build/<config-dir-basename>/
+  instead -- e.g. build/example/amnezia-sites.json -- so a demo/offline run
+  against a non-default config can never clobber the real build/ output.
+  RIPEstat/RIPE NCC caches and the last-known-good DNS cache under
+  build/cache/ are shared across configs on purpose (they are keyed by
+  hostname/IP/ASN, not by config, so two configs' entries simply coexist
+  there without colliding).
 
 Usage:
-    gen-amnezia-sites.py [--config DIR] [--dry-run] [--mode {forward,exclude}]
+    gen-amnezia-sites.py [--config DIR] [--dry-run] [--dry-run-output PATH]
+                         [--mode {forward,exclude}]
                          [--gateway-mode {direct,tunnel}] [--no-asn]
                          [--refresh] [--max-sites N] [--resolve-timeout N]
                          [--fallback-dns IP] [--self-test]
@@ -848,6 +858,19 @@ def main() -> int:
         help="print what would be generated but do not write build/ files",
     )
     parser.add_argument(
+        "--dry-run-output",
+        default=None,
+        metavar="PATH",
+        help="write the computed list for the active --mode (one CIDR per line, "
+             "same content as the normal .txt output) to PATH instead of the "
+             "usual build/<...>.txt location, and do not touch build/ at all. "
+             "Implies the same non-writing behaviour as --dry-run for build/ "
+             "itself; PATH is written regardless. Meant for split-health.sh's "
+             "registry-drift check, which runs this generator with --refresh "
+             "in the background and diffs PATH against the currently generated "
+             "file without disturbing it.",
+    )
+    parser.add_argument(
         "--mode",
         choices=("forward", "exclude"),
         default="forward",
@@ -938,6 +961,20 @@ def main() -> int:
         return 1
 
     print(f"Config dir: {config_dir}")
+
+    # Namespace build/ output by config so a run against anything other than
+    # the default local/ (e.g. --config config/example) can never clobber the
+    # real generated files: build/<config-dir-basename>/amnezia-*.{json,txt}
+    # instead of build/amnezia-*.{json,txt}. The default local/ config keeps
+    # writing straight to build/, unchanged, so nothing existing moves.
+    # build/cache/ (RIPEstat, RIPE NCC, DNS) stays shared across configs on
+    # purpose -- see the module docstring.
+    default_config_dir = REPO_ROOT / "local"
+    if config_dir == default_config_dir:
+        build_dir = REPO_ROOT / "build"
+    else:
+        build_dir = REPO_ROOT / "build" / config_dir.name
+        print(f"Build dir: {build_dir} (namespaced: --config is not the default local/)")
 
     cache_dir = REPO_ROOT / "build" / "cache"
     ripestat_dir = cache_dir / "ripestat"
@@ -1328,7 +1365,7 @@ def main() -> int:
                 f"most merges: {blockers_desc}."
             )
 
-    build_dir = REPO_ROOT / "build"
+    # build_dir was already resolved above (namespaced per --config).
     # --mode forward writes the site list (today's files, untouched by
     # --mode exclude); --mode exclude writes the exclusion set itself into
     # its own pair of files. Each mode only ever touches its own two files.
@@ -1341,7 +1378,15 @@ def main() -> int:
         json_path = build_dir / "amnezia-sites.json"
         txt_path = build_dir / "amnezia-sites.txt"
 
-    if args.dry_run:
+    if args.dry_run_output:
+        dry_run_output_path = Path(args.dry_run_output)
+        dry_run_output_path.parent.mkdir(parents=True, exist_ok=True)
+        with dry_run_output_path.open("w") as fh:
+            for net in out_networks:
+                fh.write(f"{net}\n")
+        print()
+        print(f"[dry-run-output] wrote {len(out_networks)} entries to {dry_run_output_path} (build/ untouched)")
+    elif args.dry_run:
         print()
         print(f"[dry-run] would write {len(out_networks)} entries to {json_path} and {txt_path}")
     else:

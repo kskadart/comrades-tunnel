@@ -12,6 +12,14 @@ ROOT := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 # gitignored). Override per-invocation: make CONFIG=config/example <target>.
 CONFIG ?= local
 
+# Where bin/gen-amnezia-sites.py actually writes for the active CONFIG (see
+# its own module docstring): the default local/ writes to build/, anything
+# else writes to build/<config-dir-basename>/ so a demo/offline run never
+# clobbers the real generated files. Mirrors the same rule in Python, using
+# $(abspath) so "local", "./local" and an explicit absolute path all compare
+# equal to the default.
+BUILD_SUBDIR := $(if $(filter $(abspath $(CONFIG)),$(abspath local)),$(ROOT)/build,$(ROOT)/build/$(notdir $(abspath $(CONFIG))))
+
 # Optional cap on the generated site list (see bin/gen-amnezia-sites.py
 # --max-sites): merges the smallest exclusion gaps until the list fits N
 # networks, trading a little precision for a much faster corporate VPN
@@ -68,19 +76,19 @@ preset-ru: ## Copy the ru-popular preset over $(CONFIG)/direct-domains.txt (requ
 sites: ## Generate the AmneziaVPN site list into build/
 	@python3 "$(ROOT)/bin/gen-amnezia-sites.py" --config "$(CONFIG)" $(MAX_SITES_FLAG)
 	@echo
-	@echo "Reminder: import $(ROOT)/build/amnezia-sites.json in AmneziaVPN (Split tunneling -> \"⋮\" -> \"Replace site list\") and reconnect."
+	@echo "Reminder: import $(BUILD_SUBDIR)/amnezia-sites.json in AmneziaVPN (Split tunneling -> \"⋮\" -> \"Replace site list\") and reconnect."
 
 .PHONY: sites-tunnel
 sites-tunnel: ## Generate the site list with the corporate VPN gateway routed through the personal VPN
 	@python3 "$(ROOT)/bin/gen-amnezia-sites.py" --config "$(CONFIG)" --gateway-mode tunnel $(MAX_SITES_FLAG)
 	@echo
-	@echo "Reminder: import $(ROOT)/build/amnezia-sites.json in AmneziaVPN (Split tunneling -> \"⋮\" -> \"Replace site list\") and reconnect."
+	@echo "Reminder: import $(BUILD_SUBDIR)/amnezia-sites.json in AmneziaVPN (Split tunneling -> \"⋮\" -> \"Replace site list\") and reconnect."
 
 .PHONY: sites-refresh
 sites-refresh: ## Same, forcing a re-download of the RIPE/RIPEstat cache
 	@python3 "$(ROOT)/bin/gen-amnezia-sites.py" --config "$(CONFIG)" --refresh $(MAX_SITES_FLAG)
 	@echo
-	@echo "Reminder: import $(ROOT)/build/amnezia-sites.json in AmneziaVPN (Split tunneling -> \"⋮\" -> \"Replace site list\") and reconnect."
+	@echo "Reminder: import $(BUILD_SUBDIR)/amnezia-sites.json in AmneziaVPN (Split tunneling -> \"⋮\" -> \"Replace site list\") and reconnect."
 
 .PHONY: sites-offline
 sites-offline: ## Same, without ASN expansion (--no-asn)
@@ -90,13 +98,13 @@ sites-offline: ## Same, without ASN expansion (--no-asn)
 sites-small: ## Generate a compact site list (MAX_SITES, default 400) to speed up the corporate VPN connect
 	@python3 "$(ROOT)/bin/gen-amnezia-sites.py" --config "$(CONFIG)" --max-sites $(or $(MAX_SITES),400)
 	@echo
-	@echo "Reminder: import $(ROOT)/build/amnezia-sites.json in AmneziaVPN (Split tunneling -> \"⋮\" -> \"Replace site list\") and reconnect."
+	@echo "Reminder: import $(BUILD_SUBDIR)/amnezia-sites.json in AmneziaVPN (Split tunneling -> \"⋮\" -> \"Replace site list\") and reconnect."
 
 .PHONY: sites-exclude
 sites-exclude: ## Generate the exclusion list for AmneziaVPN "all sites except the listed ones" mode
 	@python3 "$(ROOT)/bin/gen-amnezia-sites.py" --config "$(CONFIG)" --mode exclude $(MAX_SITES_FLAG)
 	@echo
-	@echo "Reminder: import $(ROOT)/build/amnezia-exclude.json in AmneziaVPN (Split tunneling -> mode \"All sites except listed ones\" -> \"⋮\" -> \"Replace site list\") and reconnect."
+	@echo "Reminder: import $(BUILD_SUBDIR)/amnezia-exclude.json in AmneziaVPN (Split tunneling -> mode \"All sites except listed ones\" -> \"⋮\" -> \"Replace site list\") and reconnect."
 
 ##@ Verify
 .PHONY: check
@@ -233,8 +241,8 @@ dns-reset: ## Reset the primary service's DNS back to DHCP (sudo)
 
 ##@ Cleanup
 .PHONY: clean
-clean: ## Remove generated build output, keeping the cache
-	@rm -f "$(ROOT)/build/amnezia-sites.json" "$(ROOT)/build/amnezia-sites.txt"
+clean: ## Remove generated build output for CONFIG, keeping the cache
+	@rm -f "$(BUILD_SUBDIR)/amnezia-sites.json" "$(BUILD_SUBDIR)/amnezia-sites.txt"
 
 .PHONY: clean-cache
 clean-cache: ## Remove the RIPE/RIPEstat cache too
