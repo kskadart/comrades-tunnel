@@ -233,7 +233,8 @@ VPN** — поэтому проверку нужно гонять сразу п�
 
 Предварительные требования: macOS, подключённый клиент Check Point Endpoint
 Security VPN, десктопное приложение AmneziaVPN 4.8+ с сервером
-WireGuard/AmneziaWG, `python3`, `git`.
+WireGuard/AmneziaWG (установка и обновление — см. «Установка и обновление
+AmneziaVPN» ниже), `python3`, `git`.
 
 1. Скопируйте шаблон конфигурации и отредактируйте каждый файл:
 
@@ -304,6 +305,103 @@ WireGuard/AmneziaWG, `python3`, `git`.
 Перегенерируйте список и переимпортируйте его в Amnezia при изменении
 `direct-domains.txt`/`direct-cidrs.txt`, а также периодически — IP-адреса
 сервисов меняются.
+
+## Установка и обновление AmneziaVPN
+
+Десктопный клиент для macOS — `.pkg` со страницы релизов
+`amnezia-vpn/amnezia-client` на GitHub. «Latest» на главной — ветка 5.x;
+последний стабильный релиз 4.8 — `4.8.21.0` (2026-07-10, stable, не
+pre-release) — находится через список тегов. Сторонние зеркала и
+менеджеры пакетов не использовать. Отдельно есть сборка 5.x для Mac App
+Store (NetworkExtension вместо LaunchDaemon) — скрипты этого репозитория
+(`AmneziaVPN-service`, имя процесса туннеля, ключи plist) рассчитаны
+только на `.pkg` с GitHub.
+
+Файлы и SHA-256 (`shasum -a 256 <file>` после скачивания):
+
+- `AmneziaVPN_4.8.21.0_macos.pkg` —
+  `da339236eef1728956197c8bf9ed96a2a21047270106e6c0aa062c9e142e3ac7` —
+  единственный macOS-файл релиза; только x86_64 (app, `AmneziaVPN-service`,
+  туннель `wireguard-go`).
+- `AmneziaVPN_5.0.1.5_macos_x64.pkg` —
+  `8e88c02605375400a7972ee5205cc6bcd223e555757522fbc97fe3c9a4946084` —
+  несмотря на `_x64`, universal (x86_64 + arm64); туннель переименован в
+  `amneziawg-go`. С этим проектом не проверялся; у 5.x открытые проблемы
+  на macOS 26.
+- `AmneziaVPN_4.8.11.4_macos.zip` (откат на 4.8.11.4, zip с
+  `AmneziaVPN.pkg` внутри) —
+  `9534563bd7810ab7bf9f920dad2ec3efc78095b4d170bdbd79ba16cbb8e93dbb`.
+
+**Установщик (проверено на 4.8.21.0).** Package identifier
+`org.amneziavpn.package` — установка поверх пакета с тем же identifier
+это upgrade in place. Выбор «Install» (по умолчанию) / «Uninstall» — при
+обновлении **не выбирать Uninstall**. postinstall выгружает старый
+LaunchDaemon, ставит приложение, кладёт plist в
+`/Library/LaunchDaemons/AmneziaVPN.plist`, загружает его и перезапускает
+приложение; ребут не нужен. `~/Library/Preferences` не трогается —
+профили серверов и списки сайтов переживают апгрейд (идентификаторы
+настроек в 4.8.x не менялись). Предупреждение в release notes про
+удаление «4.8.8.2 и ниже через .dmg» к `.pkg`-апгрейдам не относится.
+
+Процедура одна для установки и для обновления:
+
+1. Бэкап настроек плюс экспорт конфигурации сервера из приложения (меню →
+   Backup → Export):
+
+   ```
+   cp -p ~/Library/Preferences/org.amneziavpn.AmneziaVPN.plist \
+     ~/Documents/org.amneziavpn.AmneziaVPN.plist.bak-$(date +%Y%m%d-%H%M%S)
+   ```
+
+2. Отключить VPN, выйти из приложения через меню-бар, проверить, что
+   процесс не остался (вывод должен быть пустым):
+
+   ```
+   pgrep -fl AmneziaVPN
+   ```
+
+3. Открыть `.pkg`, оставить «Install», ввести пароль администратора —
+   установщик сам перезапускает демон и приложение.
+
+4. Проверить версию, демон и туннель:
+
+   ```
+   defaults read /Applications/AmneziaVPN.app/Contents/Info.plist CFBundleShortVersionString
+   plutil -p /Library/LaunchDaemons/AmneziaVPN.plist
+   pgrep -fl wireguard-go
+   ```
+
+   Ожидается label `AmneziaVPN-service`, порт `5959`; `wireguard-go` —
+   после подключения. Затем `make check` — убедиться, что разбиение не
+   сломалось.
+
+5. Откат: выйти из приложения, поставить предыдущий `.pkg`; бэкап
+   восстанавливать только при явной порче настроек и при закрытом
+   приложении.
+
+Обновление клиента и переключение режима разбиения (см. «Режимы
+AmneziaVPN» выше) — раздельные шаги с проверкой между ними: одна
+переменная за раз.
+
+### Apple Silicon
+
+Вся ветка 4.8 собрана только под Intel и на Apple Silicon работает под
+Rosetta 2. Из трекера issues: установщик может падать на чистой машине
+без Rosetta (issue #2744, 4.8.18.0 — чинится
+`softwareupdate --install-rosetta`; не подтверждено, воспроизводится ли
+это на пакете `4.8.21.0`), а туннель под трансляцией репортили как
+причину, по которой первое подключение AmneziaWG-v2 занимает несколько
+минут (issue #2650, 4.8.15.4, архитектурно — стоит ожидать и на
+4.8.21.0). Нативный Apple Silicon в `.pkg` с GitHub — с 5.0.0.5. Выбор на
+Apple Silicon: `4.8.21.0` под Rosetta (проверена автором только на
+Intel) либо `5.0.1.5` нативно (с этим проектом не проверялся, открытые
+проблемы на macOS 26). Consent одинаков на обеих архитектурах — обычный
+LaunchDaemon без системных расширений, только «Background Items Added»;
+подпись и нотаризация идентичны.
+
+Файл: Intel + 4.8.21.0 → `AmneziaVPN_4.8.21.0_macos.pkg`; Apple Silicon +
+4.8.21.0 → тот же файл под Rosetta; Apple Silicon + 5.0.1.5 →
+`AmneziaVPN_5.0.1.5_macos_x64.pkg` (universal, несмотря на имя).
 
 ## Makefile
 
