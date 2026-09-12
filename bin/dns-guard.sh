@@ -35,7 +35,7 @@
 # executing it. Exit 0 in every handled case (including "nothing to do");
 # exit 2 on a usage/config error.
 #
-# Usage: dns-guard.sh [--config DIR] [--dry-run]
+# Usage: dns-guard.sh [--config DIR] [--dry-run] [--print-service] [--self-test]
 
 set -eu
 
@@ -45,6 +45,7 @@ CONFIG_DIR=""
 CONF_FILE="$SCRIPT_DIR/dns-guard.conf"
 DRY_RUN=0
 PRINT_SERVICE=0
+SELF_TEST=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -64,28 +65,176 @@ while [ $# -gt 0 ]; do
             PRINT_SERVICE=1
             shift
             ;;
+        --self-test)
+            SELF_TEST=1
+            shift
+            ;;
         *)
-            echo "Usage: $0 [--config DIR] [--dry-run] [--print-service]" >&2
+            echo "Usage: $0 [--config DIR] [--dry-run] [--print-service] [--self-test]" >&2
             exit 2
             ;;
     esac
 done
 
-# Standalone mode: print the detected primary service name (the one DNS guard
-# would act on) and exit 0. This duplicates the interface -> service awk
-# mapping from service_for_interface() below, because this early-exit path
-# runs before that helper is defined; keep both copies in sync if the mapping
-# ever changes. Exits 2 if no default interface/service can be found.
+# service_for_interface IFACE -- print the network service name whose
+# Device matches IFACE in `networksetup -listnetworkserviceorder`'s output.
+# Moved above the --print-service early-exit below so both paths share this
+# one copy (see finding 11 in the review this fixes: the two copies used to
+# diverge, and the old --print-service copy's own bug -- see next
+# paragraph -- went unnoticed there for exactly that reason).
+#
+# A disabled service is prefixed "(*)" instead of "(N)" in that listing, and
+# can share the same Device as an enabled one (e.g. right after a hardware
+# port is toggled off in System Settings, or a duplicate virtual service).
+# The awk state machine resets `name`/`disabled` on either prefix form, and
+# only reports a match when the entry is NOT disabled -- printing the
+# disabled entry's name instead of an active one on the same Device would
+# silently mis-target every dns-guard action at the wrong network service.
+service_for_interface() {
+    iface=$1
+    networksetup -listnetworkserviceorder | awk -v want="Device: $iface)" '
+        /^\([0-9*]+\)/ {
+            disabled = ($0 ~ /^\(\*\)/)
+            name = $0
+            sub(/^\([0-9*]+\)[\t ]*/, "", name)
+        }
+        index($0, want) && !disabled { print name; exit }
+    '
+}
+
+# same_set A B -- true if space-separated lists A and B contain exactly the
+# same members, ignoring order. networksetup may echo DNS servers back in a
+# different order than SERVERS lists them (or than the OS applies them), so
+# an ordered string comparison would treat that as "still wrong" forever --
+# see the MODE=always convergence check below (finding 12).
+same_set() {
+    s1=$(printf '%s\n' $1 | sort)
+    s2=$(printf '%s\n' $2 | sort)
+    [ "$s1" = "$s2" ]
+}
+
+# log MESSAGE -- timestamped append to LOG_FILE, falling back to stderr if
+# LOG_FILE cannot be written (e.g. running unprivileged). Moved above
+# run_self_test so --self-test can exercise it directly.
+log() {
+    ts=$(date '+%Y-%m-%dT%H:%M:%S%z')
+    line="$ts $1"
+    if ! { printf '%s\n' "$line" >>"$LOG_FILE"; } 2>/dev/null; then
+        printf '%s\n' "$line" >&2
+    fi
+}
+
+# run_self_test: exercise service_for_interface (finding 11) against a
+# synthetic `networksetup -listnetworkserviceorder`-style listing containing
+# a disabled ("(*)") duplicate, and same_set (finding 12) against
+# reordered/genuinely-different lists. Independent of any config directory
+# or real networksetup/DNS state -- networksetup is shadowed for the
+# duration of this function only.
+run_self_test() {
+    fail=0
+    tmp_listing=$(mktemp) || { echo "FAIL  could not create a temp file" >&2; return 1; }
+    trap 'rm -f "$tmp_listing"' EXIT
+
+    cat >"$tmp_listing" <<'LISTING'
+(1) Wi-Fi
+(Hardware Port: Wi-Fi, Device: en0)
+
+(2) USB LAN
+(Hardware Port: USB 10/100/1000 LAN, Device: en7)
+
+(*) Old USB LAN (disabled)
+(Hardware Port: USB 10/100/1000 LAN, Device: en7)
+
+(3) iPhone USB
+(Hardware Port: iPhone USB, Device: en8)
+LISTING
+
+    networksetup() {
+        case "$1" in
+            -listnetworkserviceorder) cat "$FAKE_LISTING" ;;
+            *) return 1 ;;
+        esac
+    }
+    FAKE_LISTING="$tmp_listing"
+
+    result=$(service_for_interface en7)
+    if [ "$result" = "USB LAN" ]; then
+        echo "PASS  [finding 11] service_for_interface returns the enabled service, skipping a disabled duplicate on the same Device"
+    else
+        echo "FAIL  [finding 11] service_for_interface en7 -> '$result' (expected 'USB LAN')"
+        fail=1
+    fi
+
+    result=$(service_for_interface en0)
+    if [ "$result" = "Wi-Fi" ]; then
+        echo "PASS  [finding 11] service_for_interface still finds a normal (non-disabled-duplicate) service"
+    else
+        echo "FAIL  [finding 11] service_for_interface en0 -> '$result' (expected 'Wi-Fi')"
+        fail=1
+    fi
+
+    result=$(service_for_interface en99)
+    if [ -z "$result" ]; then
+        echo "PASS  [finding 11] service_for_interface returns empty for an interface with no matching (enabled) service"
+    else
+        echo "FAIL  [finding 11] service_for_interface en99 -> '$result' (expected empty)"
+        fail=1
+    fi
+
+    if same_set "1.1.1.1 1.0.0.1" "1.0.0.1 1.1.1.1"; then
+        echo "PASS  [finding 12] same_set treats reordered lists as equal"
+    else
+        echo "FAIL  [finding 12] same_set treated reordered lists as different"
+        fail=1
+    fi
+    if same_set "1.1.1.1 1.0.0.1" "1.1.1.1 8.8.8.8"; then
+        echo "FAIL  [finding 12] same_set treated genuinely different lists as equal"
+        fail=1
+    else
+        echo "PASS  [finding 12] same_set correctly rejects genuinely different lists"
+    fi
+
+    # Finding 16: log() must not leak the shell's own "cannot open"
+    # diagnostic to stderr when LOG_FILE is unwritable -- only the intended
+    # fallback line.
+    f16_dir=$(mktemp -d) || { echo "FAIL  [finding 16] could not create a temp dir" >&2; fail=1; f16_dir=""; }
+    if [ -n "$f16_dir" ]; then
+        LOG_FILE="$f16_dir/does-not-exist/nested/unwritable.log"
+        log_err=$(log "self-test message" 2>&1)
+        if printf '%s' "$log_err" | grep -q "self-test message" && \
+           ! printf '%s' "$log_err" | grep -qi "no such file\|cannot open\|: .*\.log:"; then
+            echo "PASS  [finding 16] log() falls back to stderr without leaking a shell redirection error"
+        else
+            echo "FAIL  [finding 16] log() stderr: $log_err"
+            fail=1
+        fi
+        rm -rf "$f16_dir"
+    fi
+
+    if [ "$fail" = 0 ]; then
+        echo "self-test: all cases PASS"
+    else
+        echo "self-test: at least one case FAILED" >&2
+    fi
+    return "$fail"
+}
+
+if [ "$SELF_TEST" = 1 ]; then
+    run_self_test
+    exit $?
+fi
+
+# Standalone mode: print the detected primary service name (the one DNS
+# guard would act on) and exit 0. Reuses service_for_interface() (defined
+# above this early-exit path, so there is exactly one copy). Exits 2 if no
+# default interface/service can be found.
 if [ "$PRINT_SERVICE" = 1 ]; then
     iface=$(route -n get default 2>/dev/null | sed -n 's/^[[:space:]]*interface: *//p' | head -1)
     if [ -z "$iface" ]; then
         echo "dns-guard: no default interface found" >&2
         exit 2
     fi
-    service=$(networksetup -listnetworkserviceorder | awk -v want="Device: $iface)" '
-        /^\([0-9]+\)/ { name = $0; sub(/^\([0-9]+\)[ \t]*/, "", name) }
-        index($0, want) { print name; exit }
-    ')
+    service=$(service_for_interface "$iface")
     if [ -z "$service" ]; then
         echo "dns-guard: no network service found for interface $iface" >&2
         exit 2
@@ -107,13 +256,7 @@ normalize_list() {
     printf '%s\n' "$1" | tr '\n' ' ' | tr -s '[:space:]' ' ' | sed -e 's/^ //' -e 's/ $//'
 }
 
-log() {
-    ts=$(date '+%Y-%m-%dT%H:%M:%S%z')
-    line="$ts $1"
-    if ! printf '%s\n' "$line" >>"$LOG_FILE" 2>/dev/null; then
-        printf '%s\n' "$line" >&2
-    fi
-}
+# log() is defined above, before run_self_test -- see finding 16.
 
 if [ -n "$CONFIG_DIR" ]; then
     DNS_GUARD_TXT="$CONFIG_DIR/dns-guard.txt"
@@ -163,13 +306,8 @@ default_interface() {
     route -n get default 2>/dev/null | sed -n 's/^[[:space:]]*interface: *//p' | head -1
 }
 
-service_for_interface() {
-    iface=$1
-    networksetup -listnetworkserviceorder | awk -v want="Device: $iface)" '
-        /^\([0-9]+\)/ { name = $0; sub(/^\([0-9]+\)[ \t]*/, "", name) }
-        index($0, want) { print name; exit }
-    '
-}
+# service_for_interface is defined above, before the --print-service
+# early-exit -- see finding 11.
 
 current_dns_list() {
     service=$1
@@ -222,7 +360,7 @@ case "$MODE" in
         fi
         ;;
     always)
-        if [ "$CURRENT_LIST" != "$SERVERS" ]; then
+        if ! same_set "$CURRENT_LIST" "$SERVERS"; then
             NEED_CHANGE=1
         fi
         ;;
@@ -235,7 +373,18 @@ if [ "$NEED_CHANGE" = 1 ]; then
         exit 0
     fi
     networksetup -setdnsservers "$SERVICE" $SERVERS
-    log "service=$SERVICE before=[$CURRENT_LIST] -> after=[$SERVERS]"
+    AFTER_LIST=$(normalize_list "$(current_dns_list "$SERVICE" | tr '\n' ' ')")
+    if [ "$MODE" = "always" ] && ! same_set "$AFTER_LIST" "$SERVERS"; then
+        # Re-read once after setting; if it still does not match, this is
+        # not converging (some other process, or the OS itself, keeps
+        # overriding it) -- log once and stop for this invocation instead
+        # of rewriting on every tick (this runs on a 3s ThrottleInterval --
+        # see the installer -- so "every tick" is every few seconds,
+        # forever).
+        log "WARNING: service=$SERVICE set SERVERS=[$SERVERS] but re-read shows [$AFTER_LIST] -- not converging; leaving it and exiting cleanly instead of rewriting every tick"
+        exit 0
+    fi
+    log "service=$SERVICE before=[$CURRENT_LIST] -> after=[$AFTER_LIST]"
 else
     if [ "$DRY_RUN" = 1 ]; then
         echo "decision: ok (mode=$MODE) service=$SERVICE current=[$CURRENT_LIST]"

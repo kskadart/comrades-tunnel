@@ -220,6 +220,10 @@ case "$TIMEOUT_FLAG" in
         echo "ERROR: --timeout must be a positive integer, got '$TIMEOUT_FLAG'" >&2
         exit 2
         ;;
+    0)
+        echo "ERROR: --timeout must be greater than 0, got '$TIMEOUT_FLAG'" >&2
+        exit 2
+        ;;
 esac
 
 case "$TRIGGER_FLAG" in
@@ -276,7 +280,14 @@ decide_state() {
     file=$2
     trigger=${3:-connect-start}
     state=$initial
-    matched=$(grep -n -E 'Starting connect|Starting new connection|no need executing firewall step|Connection was successfully established|Site is not responding|User cancelled the connection|Disconnect initiated by user' "$file" 2>/dev/null)
+    # "Site is not responding" alone can also appear as a transient
+    # tunnel-drop message while a connection is otherwise still active/in
+    # progress, not only as part of the real terminal IKE failure -- ending
+    # the window (IDLE) on the bare phrase risks restoring the personal
+    # VPN's routes mid-reconnect. Only the compound IKE-failure form (as
+    # observed live, both fragments on the same helpdesk.log line) is
+    # treated as terminal.
+    matched=$(grep -n -E 'Starting connect|Starting new connection|no need executing firewall step|Connection was successfully established|IKE connection failed.*Site is not responding|User cancelled the connection|Disconnect initiated by user' "$file" 2>/dev/null)
     if [ -z "$matched" ]; then
         printf '%s\n' "$state"
         return 0
@@ -284,6 +295,7 @@ decide_state() {
     oldifs=$IFS
     IFS='
 '
+    set -f   # a log line containing a glob metacharacter must never be pathname-expanded
     for line in $matched; do
         case "$line" in
             *'no need executing firewall step'*)
@@ -301,6 +313,7 @@ decide_state() {
                 ;;
         esac
     done
+    set +f
     IFS=$oldifs
     printf '%s\n' "$state"
 }
@@ -336,7 +349,7 @@ log() {
         printf '[dry-run, not logged] %s\n' "$line"
         return 0
     fi
-    if ! printf '%s\n' "$line" >>"$LOG_FILE" 2>/dev/null; then
+    if ! { printf '%s\n' "$line" >>"$LOG_FILE"; } 2>/dev/null; then
         printf '%s\n' "$line" >&2
     fi
 }
@@ -347,6 +360,58 @@ age_seconds() {
     mtime=$(stat -f '%m' "$1" 2>/dev/null) || return 1
     now=$(date +%s)
     echo $((now - mtime))
+}
+
+# resolve_offset CUR_SIZE [DRY] -- read OFFSET_FILE/OFFSET_INODE_FILE
+# against the current HELPDESK_LOG (whose size the caller has already read
+# as CUR_SIZE) and print "OFFSET SKIP_CYCLE REASON":
+#   - OFFSET_FILE missing entirely (this watcher has never processed this
+#     log before -- a fresh install, or STATE_DIR wiped): OFFSET is
+#     CUR_SIZE and SKIP_CYCLE is 1, REASON is "first_run" -- never replay a
+#     log's entire pre-existing history as if it just happened now (a
+#     "Starting new connection" from days ago must not be mistaken for one
+#     happening this tick).
+#   - the persisted offset now exceeds CUR_SIZE (truncation): OFFSET is 0,
+#     SKIP_CYCLE 0, REASON "truncated".
+#   - HELPDESK_LOG's inode differs from the one last recorded (a
+#     rename-based rotation -- old file renamed away, new empty-or-partial
+#     file created at the same path): OFFSET is 0, SKIP_CYCLE 0, REASON
+#     "inode_changed". This catches a rotation the size check alone would
+#     miss whenever the new file already happens to be at least as large as
+#     the old persisted offset.
+#   - otherwise: OFFSET is the persisted offset unchanged, SKIP_CYCLE 0,
+#     REASON "none".
+# With DRY=1 (used only by the --dry-run preview), nothing is written or
+# logged -- this is a preview, and must touch nothing on disk.
+resolve_offset() {
+    cur_size=$1
+    dry=${2:-0}
+    had_offset_file=0
+    [ -f "$OFFSET_FILE" ] && had_offset_file=1
+    prev_offset=$(cat "$OFFSET_FILE" 2>/dev/null)
+    case "$prev_offset" in ''|*[!0-9]*) prev_offset=0 ;; esac
+    prev_inode=$(cat "$OFFSET_INODE_FILE" 2>/dev/null)
+    case "$prev_inode" in ''|*[!0-9]*) prev_inode=0 ;; esac
+    cur_inode=$(stat -f '%i' "$HELPDESK_LOG" 2>/dev/null)
+    case "$cur_inode" in ''|*[!0-9]*) cur_inode=0 ;; esac
+    [ "$dry" = 1 ] || echo "$cur_inode" >"$OFFSET_INODE_FILE" 2>/dev/null
+
+    if [ "$had_offset_file" = 0 ]; then
+        [ "$dry" = 1 ] || log "no persisted offset for $HELPDESK_LOG yet (first run against this log); seeding at the current size ($cur_size bytes) and taking no action this cycle"
+        printf '%s %s %s\n' "$cur_size" 1 first_run
+        return 0
+    fi
+    if [ "$prev_offset" -gt "$cur_size" ] 2>/dev/null; then
+        [ "$dry" = 1 ] || log "helpdesk.log appears to have been truncated/rotated (offset $prev_offset > size $cur_size); resetting offset to 0"
+        printf '%s %s %s\n' 0 0 truncated
+        return 0
+    fi
+    if [ "$cur_inode" != 0 ] && [ "$prev_inode" != 0 ] && [ "$cur_inode" != "$prev_inode" ]; then
+        [ "$dry" = 1 ] || log "helpdesk.log's inode changed ($prev_inode -> $cur_inode; a rename-based rotation) -- resetting offset to 0"
+        printf '%s %s %s\n' 0 0 inode_changed
+        return 0
+    fi
+    printf '%s %s %s\n' "$prev_offset" 0 none
 }
 
 # do_restore -- restore_saved_routes + verify_restore (from lib-routes.sh),
@@ -390,6 +455,7 @@ restore_if_needed() {
 
 release_lock_if_held() {
     if [ "$LOCK_HELD" = 1 ]; then
+        rm -f "$LOCK_DIR/pid" 2>/dev/null
         rmdir "$LOCK_DIR" 2>/dev/null
         LOCK_HELD=0
     fi
@@ -401,21 +467,49 @@ cleanup_and_exit() {
 }
 
 # acquire_lock -- mkdir-based single-instance lock, POSIX, no bashisms.
-# Returns 0 holding the lock, 1 if another live instance holds it. A lock
-# older than TIMEOUT is presumed to belong to a dead process: broken with a
-# log line, then re-acquired.
+# Returns 0 holding the lock, 1 if another live instance holds it.
+#
+# A lock's true owner is the pid recorded in it, not its age: a normal
+# lift+wait cycle can legitimately run for a good while longer than TIMEOUT
+# (do_lift itself takes a few seconds, then wait_for_completion_then_restore
+# polls for up to TIMEOUT more on top of that) -- an age-only rule can break
+# a lock the first instance still legitimately holds, and race it while it
+# is mid-restore (a second instance's safety net could then rm the saved
+# file the first instance's own trap still needs). Break a lock only when
+# its recorded pid is provably dead (`kill -0` fails); fall back to the old
+# age rule only when the lock predates this fix and has no pid file at all.
 acquire_lock() {
     if mkdir "$LOCK_DIR" 2>/dev/null; then
+        echo $$ >"$LOCK_DIR/pid" 2>/dev/null
         return 0
     fi
-    lock_age=$(age_seconds "$LOCK_DIR")
-    if [ -n "$lock_age" ] && [ "$lock_age" -gt "$TIMEOUT" ]; then
-        log "WARNING: breaking stale lock at $LOCK_DIR (age ${lock_age}s > timeout ${TIMEOUT}s) -- presumed to belong to a dead process"
-        rmdir "$LOCK_DIR" 2>/dev/null
-        if mkdir "$LOCK_DIR" 2>/dev/null; then
-            return 0
-        fi
-    fi
+    lock_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+    case "$lock_pid" in
+        ''|*[!0-9]*)
+            lock_age=$(age_seconds "$LOCK_DIR")
+            if [ -n "$lock_age" ] && [ "$lock_age" -gt "$TIMEOUT" ]; then
+                log "WARNING: breaking stale lock at $LOCK_DIR (no pid recorded, age ${lock_age}s > timeout ${TIMEOUT}s) -- presumed to belong to a dead/pre-fix process"
+                rm -f "$LOCK_DIR/pid" 2>/dev/null
+                rmdir "$LOCK_DIR" 2>/dev/null
+                if mkdir "$LOCK_DIR" 2>/dev/null; then
+                    echo $$ >"$LOCK_DIR/pid" 2>/dev/null
+                    return 0
+                fi
+            fi
+            ;;
+        *)
+            if kill -0 "$lock_pid" 2>/dev/null; then
+                return 1   # owner is alive -- never break this lock, regardless of age
+            fi
+            log "WARNING: breaking stale lock at $LOCK_DIR (owner pid $lock_pid is dead)"
+            rm -f "$LOCK_DIR/pid" 2>/dev/null
+            rmdir "$LOCK_DIR" 2>/dev/null
+            if mkdir "$LOCK_DIR" 2>/dev/null; then
+                echo $$ >"$LOCK_DIR/pid" 2>/dev/null
+                return 0
+            fi
+            ;;
+    esac
     return 1
 }
 
@@ -483,12 +577,20 @@ do_lift() {
 wait_for_completion_then_restore() {
     start_ts=$(date +%s)
     while :; do
+        # Defense in depth alongside acquire_lock's pid check: keep the
+        # lock directory's own mtime fresh for the whole time this instance
+        # legitimately holds it, in case LOCK_DIR/pid is ever missing (e.g.
+        # a lock from before that fix) and a peer instance falls back to
+        # the age-only rule.
+        [ "${LOCK_HELD:-0}" = 1 ] && touch "${LOCK_DIR:-}" 2>/dev/null
         cur_size=$(wc -c <"$HELPDESK_LOG" 2>/dev/null | tr -d ' ')
         if [ -n "$cur_size" ]; then
-            prev_offset=$(cat "$OFFSET_FILE" 2>/dev/null)
-            case "$prev_offset" in ''|*[!0-9]*) prev_offset=0 ;; esac
-            [ "$prev_offset" -gt "$cur_size" ] && prev_offset=0
-            if [ "$cur_size" -gt "$prev_offset" ]; then
+            set -- $(resolve_offset "$cur_size")
+            prev_offset=$1
+            skip_cycle=$2
+            if [ "$skip_cycle" = 1 ]; then
+                echo "$cur_size" >"$OFFSET_FILE"
+            elif [ "$cur_size" -gt "$prev_offset" ]; then
                 slice_file="$STATE_DIR/.slice.$$"
                 tail -c +"$((prev_offset + 1))" "$HELPDESK_LOG" >"$slice_file" 2>/dev/null
                 prev_state=$(cat "$WATCH_STATE_FILE" 2>/dev/null)
@@ -508,6 +610,12 @@ wait_for_completion_then_restore() {
         elapsed=$(( $(date +%s) - start_ts ))
         if [ "$elapsed" -ge "$TIMEOUT" ]; then
             log "TIMEOUT after ${elapsed}s waiting for corporate-VPN completion; restoring unconditionally"
+            # Must happen BEFORE do_restore: leaving WATCH_STATE_FILE at
+            # STARTED here means the next tick, over an unchanged log,
+            # replays STARTED forever -- do_lift fires again every single
+            # tick even though the routes were already lifted-and-restored
+            # once. Writing IDLE now is what actually ends this cycle.
+            echo IDLE >"$WATCH_STATE_FILE"
             do_restore
             return 0
         fi
@@ -518,8 +626,11 @@ wait_for_completion_then_restore() {
 # run_safety_net_check -- the independent backstop meant to run on every
 # StartInterval tick (which, in this design, is just a normal invocation of
 # this script -- see header). Returns 1 (and has already restored) if it
-# acted; 0 otherwise, including every "nothing to check" / "not old enough
-# yet" / "utun missing" case.
+# decided a real restore was needed and ran one; 0 otherwise, including
+# every "nothing to check" / "not old enough yet" / "utun missing" case,
+# and the case where the saved-routes marker is stale but the routes are
+# demonstrably already back (cleared, but nothing was restored -- see
+# below), so the normal decision cycle is safe to run in the same tick.
 #
 # Deliberately independent of the pause switch (--pause/PAUSE_FILE, see
 # pause_state() and the top of run_decision_cycle's action check): a pause
@@ -548,6 +659,19 @@ run_safety_net_check() {
         do_restore
         return 1
     fi
+    if [ "$now_count" -ge "$expected_count" ] 2>/dev/null; then
+        # The "still lifted" marker is stale, but $personal_utun already
+        # has every route it should -- normal restore succeeded and this
+        # is a leftover marker (e.g. a crash between restore succeeding and
+        # the cleanup that follows it), or nothing was ever actually
+        # missing. Clear it instead of leaving it to wedge the daemon
+        # forever: every future tick would otherwise re-run a full,
+        # permanently-failing restore attempt against routes that are
+        # already there.
+        log "SAFETY-NET: saved-routes file is ${saved_age}s old (> ${TIMEOUT}s) but $personal_utun already has $now_count/$expected_count routes ($saved_count saved + $kept_count kept) -- routes are demonstrably back; clearing the stale marker"
+        rm -f "$SAVED_ROUTES_FILE" "$KEPT_ROUTES_FILE"
+        return 0
+    fi
     return 0
 }
 
@@ -559,16 +683,17 @@ run_decision_cycle() {
         log "cannot read $HELPDESK_LOG; fail safe, doing nothing"
         return 0
     fi
-    prev_offset=$(cat "$OFFSET_FILE" 2>/dev/null)
-    case "$prev_offset" in ''|*[!0-9]*) prev_offset=0 ;; esac
-    if [ "$prev_offset" -gt "$cur_size" ]; then
-        log "helpdesk.log appears to have rotated (offset $prev_offset > size $cur_size); resetting offset to 0"
-        prev_offset=0
+    mkdir -p "$STATE_DIR"
+    set -- $(resolve_offset "$cur_size")
+    prev_offset=$1
+    skip_cycle=$2
+    if [ "$skip_cycle" = 1 ]; then
+        echo "$cur_size" >"$OFFSET_FILE"
+        return 0
     fi
     prev_state=$(cat "$WATCH_STATE_FILE" 2>/dev/null)
     case "$prev_state" in STARTED|IDLE|CONNECTING) ;; *) prev_state=IDLE ;; esac
 
-    mkdir -p "$STATE_DIR"
     slice_file="$STATE_DIR/.slice.$$"
     tail -c +"$((prev_offset + 1))" "$HELPDESK_LOG" >"$slice_file" 2>/dev/null
     new_state=$(decide_state "$prev_state" "$slice_file" "$TRIGGER")
@@ -675,10 +800,18 @@ run_self_test() {
 "[10 Sep 11:28:39] Policy changed, restarting connection (0x9)
 " "IDLE" connect-start
 
-    test_case "connect-start followed by 'Site is not responding' (terminal, no trigger)" "IDLE" \
+    test_case "connect-start followed by the IKE-failure form of 'Site is not responding' (terminal, no trigger)" "IDLE" \
 "[11 Sep  0:58:11] Starting connect...
 [11 Sep  1:00:57] IKE connection failed, error code=-1000. Reason: Site is not responding.
 " "IDLE" connect-start
+
+    # Finding 15: a BARE "Site is not responding" (no "IKE connection
+    # failed" prefix) is a transient tunnel-drop message, not the terminal
+    # form -- it must never end the window (state must stay STARTED here,
+    # i.e. this line matches nothing at all).
+    test_case "[finding 15] bare 'Site is not responding' WITHOUT the IKE-failure prefix does not end the window" "STARTED" \
+"[11 Sep  1:05:00] Site is not responding
+" "STARTED" connect-start
 
     test_case "empty/unchanged tail (no trigger)" "IDLE" "" "IDLE" connect-start
 
@@ -748,6 +881,7 @@ run_self_test() {
         SAVED_ROUTES_FILE="$cycle_dir/saved-routes.txt"
         KEPT_ROUTES_FILE="$cycle_dir/kept-routes.txt"
         OFFSET_FILE="$cycle_dir/offset"
+        OFFSET_INODE_FILE="$cycle_dir/offset-inode"
         WATCH_STATE_FILE="$cycle_dir/state"
         LOG_FILE="$cycle_dir/log"
         LAST_LIFT_FILE="$cycle_dir/last-lift"
@@ -759,6 +893,12 @@ run_self_test() {
         DRY_RUN=0
         TRIGGER=connect-start
         printf '%s\n' "[11 Sep 10:00:00] Starting new connection (0x9)" >"$HELPDESK_LOG"
+        # Seed the offset state as though this log has already been watched
+        # from byte 0 (not a first-ever run -- see finding 13/resolve_offset,
+        # which deliberately skips all action on a genuinely first-ever run,
+        # a scenario this particular test is not exercising).
+        echo 0 >"$OFFSET_FILE"
+        stat -f '%i' "$HELPDESK_LOG" >"$OFFSET_INODE_FILE" 2>/dev/null
 
         run_decision_cycle
         cycle_log=$(cat "$LOG_FILE" 2>/dev/null)
@@ -819,16 +959,358 @@ run_self_test() {
         rm -rf "$pause_tmp"
     fi
 
+    # --- Finding 1: restore_saved_routes must never replay the utun name
+    # recorded in SAVED_ROUTES_FILE -- it must re-detect the CURRENTLY live
+    # personal-VPN interface and use that name for every entry, and must
+    # refuse outright (never guess) when no such interface is present.
+    # Subshell so the sudo/detect_utun_by_prefix overrides below never
+    # leak, and so no real `route add` is ever invoked.
+    if (
+        f1_dir=$(mktemp -d) || exit 1
+        trap 'rm -rf "$f1_dir"' EXIT
+        f1_calls="$f1_dir/sudo-calls"
+        : >"$f1_calls"
+        sudo() { printf '%s\n' "$*" >>"$f1_calls"; return 0; }
+
+        SAVED_ROUTES_FILE="$f1_dir/saved.txt"
+        KEPT_ROUTES_FILE="$f1_dir/kept.txt"
+        PERSONAL_TUNNEL_PREFIX="203.0.113."
+        RESTORE_HAD_FAILURES=0
+        RESTORE_VERIFY_FAILED=0
+        printf '10.9.9.0/24 utun_stale_name\n' >"$SAVED_ROUTES_FILE"
+        f1_fail=0
+
+        # (a) the live interface differs from the saved name -- the saved
+        # name must never appear in what gets executed.
+        detect_utun_by_prefix() { echo "utun_live_name"; }
+        restore_saved_routes >/dev/null
+        if grep -q -- '-interface utun_live_name' "$f1_calls" && ! grep -q 'utun_stale_name' "$f1_calls"; then
+            echo "PASS  [finding 1] restore_saved_routes replays onto the LIVE-detected utun, never the one saved"
+        else
+            echo "FAIL  [finding 1] sudo calls: $(cat "$f1_calls")"
+            f1_fail=1
+        fi
+
+        # (b) no personal-VPN utun present at all -- must refuse, not guess.
+        # Called directly (output redirected to a file, not captured via
+        # "$(...)") so RESTORE_HAD_FAILURES -- set as a plain global inside
+        # restore_saved_routes -- is visible here afterward; "$(...)" would
+        # fork its own subshell and lose that write.
+        : >"$f1_calls"
+        RESTORE_HAD_FAILURES=0
+        detect_utun_by_prefix() { return 1; }
+        restore_saved_routes >"$f1_dir/out" 2>&1
+        out=$(cat "$f1_dir/out")
+        if [ ! -s "$f1_calls" ] && [ "$RESTORE_HAD_FAILURES" = 1 ] && printf '%s' "$out" | grep -q 'refusing to restore'; then
+            echo "PASS  [finding 1] restore_saved_routes refuses (no route add attempted) when no live personal-VPN utun is present"
+        else
+            echo "FAIL  [finding 1] refusal case: RESTORE_HAD_FAILURES=$RESTORE_HAD_FAILURES sudo_calls='$(cat "$f1_calls")' out='$out'"
+            f1_fail=1
+        fi
+        exit "$f1_fail"
+    ); then
+        :
+    else
+        fail=1
+    fi
+
+    # --- Finding 2: wait_for_completion_then_restore's timeout branch must
+    # write IDLE to WATCH_STATE_FILE, or an unchanged log at the next tick
+    # replays STARTED forever and do_lift fires on every tick (a permanent
+    # re-lift loop). Subshell so the sudo/detect_utun_by_prefix/
+    # routes_on_iface overrides below never leak -- SAVED_ROUTES_FILE etc.
+    # here are throwaway temp files, never a real route or utun.
+    if (
+        f2_dir=$(mktemp -d) || exit 1
+        trap 'rm -rf "$f2_dir"' EXIT
+        detect_utun_by_prefix() { echo "utun42"; }
+        routes_on_iface() { echo 1; }
+        sudo() { return 0; }
+
+        STATE_DIR="$f2_dir"
+        SAVED_ROUTES_FILE="$f2_dir/saved-routes.txt"
+        KEPT_ROUTES_FILE="$f2_dir/kept-routes.txt"
+        OFFSET_FILE="$f2_dir/offset"
+        OFFSET_INODE_FILE="$f2_dir/offset-inode"
+        WATCH_STATE_FILE="$f2_dir/state"
+        LOG_FILE="$f2_dir/log"
+        LAST_LIFT_FILE="$f2_dir/last-lift"
+        PAUSE_FILE="$f2_dir/paused-until"
+        HELPDESK_LOG="$f2_dir/helpdesk.log"
+        PERSONAL_TUNNEL_PREFIX="203.0.113."
+        KEEP_ROUTES_FILE="$f2_dir/keep-routes-for.txt"
+        TIMEOUT=0
+        DRY_RUN=0
+        TRIGGER=connect-start
+        RESTORE_DONE=0
+        f2_fail=0
+
+        printf '%s\n' "[11 Sep 10:00:00] Starting new connection (0x9)" >"$HELPDESK_LOG"
+        echo 0 >"$OFFSET_FILE"
+        echo STARTED >"$WATCH_STATE_FILE"
+        printf '10.77.0.0/24 utun42\n' >"$SAVED_ROUTES_FILE"
+
+        wait_for_completion_then_restore >/dev/null
+
+        watch_after=$(cat "$WATCH_STATE_FILE" 2>/dev/null)
+        if [ "$watch_after" = "IDLE" ] && [ ! -f "$SAVED_ROUTES_FILE" ]; then
+            echo "PASS  [finding 2] timeout branch clears WATCH_STATE_FILE to IDLE and completes the restore"
+        else
+            saved_exists=no; [ -f "$SAVED_ROUTES_FILE" ] && saved_exists=yes
+            echo "FAIL  [finding 2] timeout branch left state='$watch_after' saved_file_exists=$saved_exists"
+            f2_fail=1
+        fi
+
+        # Second decision cycle, same (unchanged) log: must NOT lift again.
+        rm -f "$LOG_FILE"
+        run_decision_cycle >/dev/null
+        if [ -f "$SAVED_ROUTES_FILE" ] || grep -q 'saved .* routes from' "$LOG_FILE" 2>/dev/null; then
+            echo "FAIL  [finding 2] second decision cycle over an unchanged log lifted again"
+            f2_fail=1
+        else
+            echo "PASS  [finding 2] second decision cycle over an unchanged log takes no lift action"
+        fi
+        exit "$f2_fail"
+    ); then
+        :
+    else
+        fail=1
+    fi
+
+    # --- Finding 3: acquire_lock must key off pid liveness, not just age.
+    f3_dir=$(mktemp -d) || { echo "FAIL  [finding 3] could not create temp dir" >&2; fail=1; f3_dir=""; }
+    if [ -n "$f3_dir" ]; then
+        LOG_FILE="$f3_dir/log"
+        TIMEOUT=0   # any age at all would look "stale" under the old age-only rule
+
+        # A lock owned by a live process (this shell's own pid is alive)
+        # must never be broken, no matter how old it looks.
+        alive_lock="$f3_dir/lock-alive"
+        mkdir "$alive_lock"
+        echo $$ >"$alive_lock/pid"
+        touch -t 202001010000 "$alive_lock"
+        LOCK_DIR="$alive_lock"
+        if acquire_lock; then
+            echo "FAIL  [finding 3] acquire_lock broke a lock owned by a live pid ($$)"
+            fail=1
+        else
+            echo "PASS  [finding 3] acquire_lock leaves a live-owned lock alone regardless of age"
+        fi
+
+        # A lock naming a pid that is certainly dead (spawned and already
+        # waited on) must be broken and re-acquired even though a FRESH
+        # mkdir (age 0) would have passed the old age-only check.
+        ( exit 0 ) &
+        dead_pid=$!
+        wait "$dead_pid" 2>/dev/null
+        dead_lock="$f3_dir/lock-dead"
+        mkdir "$dead_lock"
+        echo "$dead_pid" >"$dead_lock/pid"
+        LOCK_DIR="$dead_lock"
+        if acquire_lock && [ -f "$LOCK_DIR/pid" ] && [ "$(cat "$LOCK_DIR/pid")" = "$$" ]; then
+            echo "PASS  [finding 3] acquire_lock breaks and re-acquires a lock whose owner pid is dead"
+        else
+            echo "FAIL  [finding 3] acquire_lock did not break/re-acquire a dead-pid lock"
+            fail=1
+        fi
+        LOCK_HELD=1
+        release_lock_if_held
+        rm -rf "$f3_dir"
+    fi
+
+    # --- Finding 5(ii): run_safety_net_check must clear a stale
+    # saved-routes marker once the personal VPN's routes are demonstrably
+    # already back (now_count >= expected_count), instead of leaving the
+    # "still lifted" marker in place forever (which would otherwise re-run
+    # a full, permanently-failing restore attempt on every future tick).
+    # Subshell so the detect_utun_by_prefix/routes_on_iface/sudo overrides
+    # never leak.
+    if (
+        f5b_dir=$(mktemp -d) || exit 1
+        trap 'rm -rf "$f5b_dir"' EXIT
+        detect_utun_by_prefix() { echo "utun42"; }
+        routes_on_iface() { echo 1; }   # "already back": matches expected_count below
+
+        SAVED_ROUTES_FILE="$f5b_dir/saved.txt"
+        KEPT_ROUTES_FILE="$f5b_dir/kept.txt"
+        LOG_FILE="$f5b_dir/log"
+        PERSONAL_TUNNEL_PREFIX="203.0.113."
+        TIMEOUT=0
+        f5b_fail=0
+
+        printf '10.9.9.0/24 utun42\n' >"$SAVED_ROUTES_FILE"
+        touch -t 202001010000 "$SAVED_ROUTES_FILE"
+
+        run_safety_net_check
+        rc=$?
+        if [ "$rc" = 0 ] && [ ! -f "$SAVED_ROUTES_FILE" ] && grep -q 'demonstrably back' "$LOG_FILE" 2>/dev/null; then
+            echo "PASS  [finding 5ii] run_safety_net_check clears a stale marker once routes are already back"
+        else
+            saved_exists=no; [ -f "$SAVED_ROUTES_FILE" ] && saved_exists=yes
+            echo "FAIL  [finding 5ii] rc=$rc saved_exists=$saved_exists log=$(cat "$LOG_FILE" 2>/dev/null)"
+            f5b_fail=1
+        fi
+
+        # Contrast: when routes are genuinely NOT back yet, the existing
+        # restore path must still fire (unaffected by this fix).
+        sudo() { return 0; }
+        routes_on_iface() { echo 0; }
+        printf '10.9.9.0/24 utun42\n' >"$SAVED_ROUTES_FILE"
+        touch -t 202001010000 "$SAVED_ROUTES_FILE"
+        rm -f "$LOG_FILE"
+        run_safety_net_check
+        rc2=$?
+        if [ "$rc2" = 1 ] && grep -q 'restoring unconditionally' "$LOG_FILE" 2>/dev/null; then
+            echo "PASS  [finding 5ii] run_safety_net_check still restores when routes are genuinely not back yet"
+        else
+            echo "FAIL  [finding 5ii] contrast case rc=$rc2 log=$(cat "$LOG_FILE" 2>/dev/null)"
+            f5b_fail=1
+        fi
+        exit "$f5b_fail"
+    ); then
+        :
+    else
+        fail=1
+    fi
+
+    # --- Finding 13: resolve_offset must seed (not replay) on a first-ever
+    # run, and must detect a rename-based rotation via inode change even
+    # when the new file's size does not shrink below the old offset.
+    f13_dir=$(mktemp -d) || { echo "FAIL  [finding 13] could not create temp dir" >&2; fail=1; f13_dir=""; }
+    if [ -n "$f13_dir" ]; then
+        HELPDESK_LOG="$f13_dir/helpdesk.log"
+        OFFSET_FILE="$f13_dir/offset"
+        OFFSET_INODE_FILE="$f13_dir/offset-inode"
+        LOG_FILE="$f13_dir/log"
+
+        # (a) first run ever: no OFFSET_FILE at all -- must seed at the
+        # current size and signal "skip this cycle", never "replay from 0".
+        printf 'line one\nline two\n' >"$HELPDESK_LOG"
+        cur_size=$(wc -c <"$HELPDESK_LOG" | tr -d ' ')
+        set -- $(resolve_offset "$cur_size")
+        off=$1; skip=$2; reason=$3
+        if [ "$off" = "$cur_size" ] && [ "$skip" = 1 ] && [ "$reason" = "first_run" ]; then
+            echo "PASS  [finding 13] resolve_offset seeds at the current size and skips the first cycle when OFFSET_FILE is missing"
+        else
+            echo "FAIL  [finding 13] first-run result: off=$off skip=$skip reason=$reason (expected off=$cur_size skip=1 reason=first_run)"
+            fail=1
+        fi
+        echo "$cur_size" >"$OFFSET_FILE"
+
+        # (b) subsequent, unchanged call: no rotation, offset carried
+        # forward unchanged, cycle not skipped.
+        set -- $(resolve_offset "$cur_size")
+        off=$1; skip=$2; reason=$3
+        if [ "$off" = "$cur_size" ] && [ "$skip" = 0 ] && [ "$reason" = "none" ]; then
+            echo "PASS  [finding 13] resolve_offset is a no-op once the offset is already seeded and nothing changed"
+        else
+            echo "FAIL  [finding 13] steady-state result: off=$off skip=$skip reason=$reason"
+            fail=1
+        fi
+
+        # (c) rename-based rotation: a NEW file appears at the same path
+        # with a DIFFERENT inode, and its size is already >= the old
+        # persisted offset -- the case a size-only heuristic would miss.
+        rm -f "$HELPDESK_LOG"
+        printf 'brand new file, already bigger than before\n' >"$HELPDESK_LOG"
+        new_size=$(wc -c <"$HELPDESK_LOG" | tr -d ' ')
+        if [ "$new_size" -lt "$cur_size" ]; then
+            echo "FAIL  [finding 13] test fixture invalid: new file ($new_size bytes) is not >= old offset ($cur_size bytes)" >&2
+            fail=1
+        else
+            set -- $(resolve_offset "$new_size")
+            off=$1; skip=$2; reason=$3
+            if [ "$off" = 0 ] && [ "$reason" = "inode_changed" ]; then
+                echo "PASS  [finding 13] resolve_offset detects a rename-based rotation via inode change even though size did not shrink"
+            else
+                echo "FAIL  [finding 13] rotation result: off=$off skip=$skip reason=$reason"
+                fail=1
+            fi
+        fi
+        rm -rf "$f13_dir"
+    fi
+
+    # --- Finding 14: compute_keep_set must invoke /usr/bin/python3
+    # directly, never a PATH-resolved "python3" that could be shadowed
+    # (e.g. by a user-installed python, or, in the LaunchDaemon's minimal
+    # PATH, by something unexpected). Subshell so the fake PATH entry
+    # never leaks.
+    if [ "$SUDO" = "sudo" ]; then
+        echo "PASS  [finding 14] lib-routes.sh's \$SUDO is 'sudo' when not running as root"
+    else
+        echo "FAIL  [finding 14] \$SUDO='$SUDO' while not root (expected 'sudo')"
+        fail=1
+    fi
+    if (
+        f14_dir=$(mktemp -d) || exit 1
+        trap 'rm -rf "$f14_dir"' EXIT
+        cat >"$f14_dir/python3" <<'EOF'
+#!/bin/sh
+echo "FAKE-PYTHON-RAN" >&2
+exit 1
+EOF
+        chmod +x "$f14_dir/python3"
+        PATH="$f14_dir:$PATH"
+        export PATH
+        KEEP_ROUTES_FILE="$f14_dir/keep.txt"
+        KEEP_ROUTES_SCRIPT="$SCRIPT_DIR/keep-routes.py"
+        KEPT_ROUTES_FILE="$f14_dir/kept.txt"
+        routes_file="$f14_dir/routes.txt"
+        printf '1.2.3.0/24 utun9\n' >"$routes_file"
+        printf '1.2.3.0/24\n' >"$KEEP_ROUTES_FILE"
+        out=$(compute_keep_set "$routes_file" 2>&1)
+        if printf '%s' "$out" | grep -q "FAKE-PYTHON-RAN"; then
+            echo "FAIL  [finding 14] compute_keep_set ran a PATH-shadowed python3 instead of /usr/bin/python3"
+            exit 1
+        else
+            echo "PASS  [finding 14] compute_keep_set invokes /usr/bin/python3 directly, ignoring a shadowing PATH entry"
+        fi
+    ); then
+        :
+    else
+        fail=1
+    fi
+
+    # --- Finding 16: reject --timeout 0 (meaningless -- every wait/lock
+    # check here treats a 0 timeout as "already timed out"/"immediately
+    # stale").
+    f16_out=$("$0" --timeout 0 2>&1)
+    f16_rc=$?
+    if [ "$f16_rc" -ne 0 ] && printf '%s' "$f16_out" | grep -qi 'timeout'; then
+        echo "PASS  [finding 16] --timeout 0 is rejected"
+    else
+        echo "FAIL  [finding 16] --timeout 0 -> rc=$f16_rc out='$f16_out' (expected a rejection)"
+        fail=1
+    fi
+
+    # --- Finding 16: log() must not leak the shell's own "cannot open"
+    # diagnostic to stderr when LOG_FILE is unwritable -- only the intended
+    # fallback line.
+    f16log_dir=$(mktemp -d) || { echo "FAIL  [finding 16] could not create temp dir" >&2; fail=1; f16log_dir=""; }
+    if [ -n "$f16log_dir" ]; then
+        DRY_RUN=0
+        LOG_FILE="$f16log_dir/does-not-exist/nested/unwritable.log"
+        log_err=$(log "self-test message" 2>&1)
+        if printf '%s' "$log_err" | grep -q "self-test message" && \
+           ! printf '%s' "$log_err" | grep -qi "no such file\|cannot open\|: .*\.log:"; then
+            echo "PASS  [finding 16] log() falls back to stderr without leaking a shell redirection error"
+        else
+            echo "FAIL  [finding 16] log() stderr: $log_err"
+            fail=1
+        fi
+        rm -rf "$f16log_dir"
+    fi
+
     # --- keep-routes: containment/fail-safe unit tests live in
     # keep-routes.py itself (native language for CIDR arithmetic); fold its
     # result into ours so one --self-test command covers everything.
-    if command -v python3 >/dev/null 2>&1; then
-        kr_out=$(python3 "$SCRIPT_DIR/keep-routes.py" --self-test)
+    if [ -x /usr/bin/python3 ]; then
+        kr_out=$(/usr/bin/python3 "$SCRIPT_DIR/keep-routes.py" --self-test)
         kr_rc=$?
         printf '%s\n' "$kr_out"
         [ "$kr_rc" -ne 0 ] && fail=1
     else
-        echo "FAIL  keep-routes.py --self-test: python3 not available to run it" >&2
+        echo "FAIL  keep-routes.py --self-test: /usr/bin/python3 not available to run it" >&2
         fail=1
     fi
 
@@ -901,6 +1383,7 @@ BUILD_DIR="$STATE_DIR"
 
 SAVED_ROUTES_FILE="$STATE_DIR/route-lift-saved-routes.txt"
 OFFSET_FILE="$STATE_DIR/offset"
+OFFSET_INODE_FILE="$STATE_DIR/offset-inode"
 WATCH_STATE_FILE="$STATE_DIR/state"
 LOCK_DIR="$STATE_DIR/lock"
 PAUSE_FILE="$STATE_DIR/paused-until"
@@ -1011,18 +1494,19 @@ if [ "$DRY_RUN" = 1 ]; then
         exit 0
     fi
     cur_size=$(wc -c <"$HELPDESK_LOG" 2>/dev/null | tr -d ' ')
-    prev_offset=$(cat "$OFFSET_FILE" 2>/dev/null)
-    case "$prev_offset" in ''|*[!0-9]*) prev_offset=0 ;; esac
-    rotated=0
-    if [ "$prev_offset" -gt "$cur_size" ]; then
-        rotated=1
-        prev_offset=0
-    fi
+    set -- $(resolve_offset "$cur_size" 1)
+    prev_offset=$1
+    skip_cycle=$2
+    reason=$3
     prev_state=$(cat "$WATCH_STATE_FILE" 2>/dev/null)
     case "$prev_state" in STARTED|IDLE|CONNECTING) ;; *) prev_state=IDLE ;; esac
 
     echo "Persisted offset: $prev_offset   Current file size: $cur_size bytes   New bytes: $((cur_size - prev_offset))"
-    [ "$rotated" = 1 ] && echo "NOTE: persisted offset exceeded the file size -- log rotation detected, would reset offset to 0"
+    case "$reason" in
+        first_run) echo "NOTE: no persisted offset yet for $HELPDESK_LOG -- a live run would seed the offset at the current size and take NO action this cycle (never replay the log's entire history)." ;;
+        truncated) echo "NOTE: persisted offset exceeded the file size -- log truncation/rotation detected, would reset offset to 0" ;;
+        inode_changed) echo "NOTE: $HELPDESK_LOG's inode differs from the last one seen -- a rename-based rotation, would reset offset to 0" ;;
+    esac
     echo "Persisted state: $prev_state"
 
     slice_file=$(mktemp)

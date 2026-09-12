@@ -44,6 +44,8 @@ Usage:
 import ipaddress
 import socket
 import sys
+import threading
+import time
 
 RESOLVE_TIMEOUT = 3  # seconds per domain lookup, per the README/header
 
@@ -76,19 +78,39 @@ def resolve_entry(entry, timeout=RESOLVE_TIMEOUT):
     """Return (list of (network, detail), error_or_None) for one keep-file
     entry. A literal IP/CIDR always succeeds with detail "-". A domain is
     resolved to its IPv4 addresses via getaddrinfo; error is a short
-    human-readable string on failure, None on success."""
+    human-readable string on failure, None on success.
+
+    socket.getaddrinfo() has no timeout of its own -- socket.setdefaulttimeout()
+    only bounds blocking operations on socket OBJECTS, never the resolver
+    call itself (the same gotcha bin/gen-amnezia-sites.py's resolve_ipv4()
+    documents and works around), so an unreachable/slow resolver could
+    previously block this for however long the system resolver takes to
+    give up, making RESOLVE_TIMEOUT a no-op. Run the actual lookup in a
+    daemon thread and join it with a hard cap instead: if the thread is
+    still running when the join returns, treat it exactly like a
+    resolution failure and move on -- the thread keeps blocking in the
+    background, but being a daemon thread it never delays process exit.
+    """
     if is_literal(entry):
         net = ipaddress.ip_network(entry, strict=False)
         return [(net, "-")], None
-    old_timeout = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(timeout)
-    try:
-        infos = socket.getaddrinfo(entry, None, socket.AF_INET)
-    except OSError as exc:
-        return [], str(exc)
-    finally:
-        socket.setdefaulttimeout(old_timeout)
-    addrs = sorted({info[4][0] for info in infos})
+
+    outcome = {}
+
+    def worker():
+        try:
+            outcome["infos"] = socket.getaddrinfo(entry, None, socket.AF_INET)
+        except OSError as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        return [], "timed out after %ss" % timeout
+    if "error" in outcome:
+        return [], str(outcome["error"])
+    addrs = sorted({info[4][0] for info in outcome.get("infos", [])})
     if not addrs:
         return [], "no A records"
     return [(ipaddress.ip_network(addr + "/32"), addr) for addr in addrs], None
@@ -103,12 +125,24 @@ def network_contains(outer, inner):
 
 
 def parse_routes(path):
-    """Yield (dest_text, gateway_text, network_or_None) for every line in
-    path. network is None for "default" or anything else that fails to
-    parse -- callers must simply skip those, never treat it as fatal (the
-    default route is never a candidate to keep or delete -- see
-    lib-routes.sh delete_amnezia_routes)."""
+    """Return (routes, warnings): routes is a list of (dest_text,
+    gateway_text, network_or_None) for every line in path -- network is
+    None for "default" (never a candidate to keep or delete -- see
+    lib-routes.sh delete_amnezia_routes) or anything else that fails to
+    parse. warnings holds one human-readable string per destination that
+    failed to parse, plus a trailing count if any did.
+
+    A destination this can't parse is otherwise silently never kept (net is
+    None, so callers just skip it -- see compute() below), which is exactly
+    the failure mode this warns about: lib-routes.sh's normalize_dest
+    should always hand this a fully-expanded a.b.c.d/len or host address
+    before it ever reaches a saved-routes file, so this should be rare/
+    never in practice, but a route this can't parse must be visible, not
+    silent, if it ever happens (e.g. a caller other than
+    save_amnezia_routes feeding this an un-normalised line)."""
     routes = []
+    warnings = []
+    unparseable = 0
     with open(path) as f:
         for line in f:
             line = line.rstrip("\n")
@@ -124,8 +158,18 @@ def parse_routes(path):
                 net = ipaddress.ip_network(dest, strict=False)
             except ValueError:
                 net = None
+                unparseable += 1
+                warnings.append(
+                    "keep-routes: route destination '%s' could not be parsed as an IP network -- it can never be matched/kept"
+                    % dest
+                )
             routes.append((dest, gw, net))
-    return routes
+    if unparseable:
+        warnings.append(
+            "keep-routes: %d route destination(s) could not be parsed and can never be matched/kept"
+            % unparseable
+        )
+    return routes, warnings
 
 
 def compute(keep_file, routes_file):
@@ -158,7 +202,8 @@ def compute(keep_file, routes_file):
             % (len(entries), "y" if len(entries) == 1 else "ies", keep_file)
         )
 
-    routes = parse_routes(routes_file)
+    routes, route_warnings = parse_routes(routes_file)
+    warnings = warnings + route_warnings
     kept = []
     for dest, gw, net in routes:
         if net is None:
@@ -238,6 +283,53 @@ def cmd_self_test():
             f.write("1.2.3.0/24\n")
         kept, _warnings, fatal = compute(literal_keep, routes_path)
         check("a literal CIDR entry keeps a route on a real compute() call", fatal is None and len(kept) == 1)
+
+        # Finding 6: a route destination that still can't be parsed (e.g.
+        # fed by some other caller with a raw, un-normalised route -- see
+        # lib-routes.sh normalize_dest) is warned about and never kept,
+        # instead of silently vanishing with no trace.
+        bad_routes_path = os.path.join(d, "bad-routes.txt")
+        with open(bad_routes_path, "w") as f:
+            f.write("104.16 utun9\n")   # 2-octet, no-slash: unparseable by ipaddress directly
+        kept, warnings, fatal = compute(literal_keep, bad_routes_path)
+        check(
+            "an unparseable route destination is warned about and never kept",
+            kept == [] and fatal is None and any("could not be parsed" in w for w in warnings),
+        )
+
+        # Finding 6: once lib-routes.sh's normalize_dest has expanded a
+        # 2-octet form into an explicit CIDR (104.16 -> 104.16.0.0/16), it
+        # is matched here exactly like any other literal CIDR route.
+        normalized_routes_path = os.path.join(d, "normalized-routes.txt")
+        with open(normalized_routes_path, "w") as f:
+            f.write("104.16.0.0/16 utun9\n")
+        matching_keep = os.path.join(d, "matching.txt")
+        with open(matching_keep, "w") as f:
+            f.write("104.16.0.0/16\n")
+        kept, _warnings, fatal = compute(matching_keep, normalized_routes_path)
+        check("a normalised 2-octet-derived route (104.16.0.0/16) is matched", fatal is None and len(kept) == 1)
+
+    # Finding 7: socket.setdefaulttimeout() does not bound getaddrinfo() --
+    # resolve_entry must still return within RESOLVE_TIMEOUT even against a
+    # resolver call that hangs far longer than that. Fake it by monkey-
+    # patching socket.getaddrinfo to sleep well past the timeout.
+    orig_getaddrinfo = socket.getaddrinfo
+
+    def _hanging_getaddrinfo(*_args, **_kwargs):
+        time.sleep(2.0)
+        return orig_getaddrinfo("127.0.0.1", None)
+
+    socket.getaddrinfo = _hanging_getaddrinfo
+    try:
+        start = time.monotonic()
+        nets, err = resolve_entry("hangs.invalid", timeout=0.2)
+        elapsed = time.monotonic() - start
+    finally:
+        socket.getaddrinfo = orig_getaddrinfo
+    check(
+        "resolve_entry returns within the timeout cap against a hanging resolver, not the full delay",
+        nets == [] and err is not None and elapsed < 1.0,
+    )
 
     return fail[0]
 

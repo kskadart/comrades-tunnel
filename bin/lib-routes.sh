@@ -30,10 +30,23 @@
 #                            (truncated first on every call); read back by
 #                            verify_restore() to size-check the restore
 #                            correctly when some routes were never deleted
+#   SCRIPT_DIR              directory this file lives in; both callers set
+#                            it before sourcing this file. Only used by
+#                            manual_restore_hint() to embed a live
+#                            re-detection command (see that function).
 #
 # The data file itself is read back with `read` and passed to `route` as
 # literal, quoted arguments only -- never sourced or eval'd, same discipline
 # dns-guard.sh uses for its own config files.
+
+# Never sudo when already root (e.g. a LaunchDaemon, which already runs as
+# root): an extra sudo is unnecessary and, on a locked-down root PATH,
+# possibly missing. Computed once at source time.
+if [ "$(id -u)" = 0 ]; then
+    SUDO=""
+else
+    SUDO="sudo"
+fi
 
 # detect_utun_by_prefix PREFIX -- print the first utunN whose inet address
 # starts with PREFIX, never hardcoding a specific utun number.
@@ -59,6 +72,19 @@ route_count() {
 # IFACE. Factored out of verify_restore so route-lift-watcher.sh's safety net
 # (which needs the same count, for a different utun at a different time) does
 # not duplicate the awk pipeline.
+#
+# Note on the `$NF==i` predicate used here and everywhere else in this file:
+# `netstat -rn -f inet` rows have 4 fields (Destination Gateway Flags Netif)
+# or, for link-layer/ARP-style entries, 5 (with a trailing Expire value) --
+# see route_count()'s own field-count comment. For a 5-field row, $NF is
+# that Expire value (a number, or "!"), never an interface name, so such a
+# row can never spuriously match an iface filter here regardless of its
+# actual Netif -- it just never matches at all (fails closed: excluded, not
+# mis-attributed to the wrong interface). utun (VPN tunnel) interfaces do
+# not have ARP/link-layer entries in practice, so this has not been
+# observed to exclude anything real, but the predicate's own safety does
+# not depend on that -- it is structurally unable to select a foreign
+# interface's row.
 routes_on_iface() {
     iface=$1
     netstat -rn -f inet 2>/dev/null | awk -v i="$iface" '$NF==i' | wc -l | tr -d ' '
@@ -100,7 +126,25 @@ normalize_dest() {
             printf '%s.%s.%s.%s/%s\n' "${1:-0}" "${2:-0}" "${3:-0}" "${4:-0}" "$plen"
             ;;
         *.*)
-            echo "$dest"
+            # No explicit "/len" -- netstat only omits it when the mask
+            # equals the classful default for the octet count shown (e.g.
+            # "5.32" for 5.32.0.0/13's classful stand-in, "128.204.80" for
+            # a /20). A full 4-octet form is an unambiguous host address
+            # and passes through unchanged; 2/3-octet forms must be
+            # expanded here -- ipaddress.ip_network() in keep-routes.py
+            # rejects a bare "104.16" or "192.168.50" outright (not a
+            # partial-address guess it is willing to make), so leaving them
+            # unexpanded made a provider route in this form silently never
+            # matchable by the keep-routes feature.
+            oldifs=$IFS
+            IFS=.
+            set -- $dest
+            IFS=$oldifs
+            case $# in
+                2) printf '%s.%s.0.0/16\n' "$1" "$2" ;;
+                3) printf '%s.%s.%s.0/24\n' "$1" "$2" "$3" ;;
+                *) echo "$dest" ;;   # 4 octets (a full host address) -- unchanged
+            esac
             ;;
         *)
             echo "${dest}.0.0.0/8"
@@ -108,12 +152,22 @@ normalize_dest() {
     esac
 }
 
-# manual_restore_hint -- print the one-liner that restores SAVED_ROUTES_FILE
+# manual_restore_hint -- print the command(s) that restore SAVED_ROUTES_FILE
 # by hand. Printed up front (before anything is deleted) and reprinted by
 # restore_saved_routes/verify_restore on any failure, so it must stay a
 # single source of truth for that command.
+#
+# Deliberately does NOT embed a specific "utunN" gateway name: utun numbers
+# are not stable across sessions (a reconnect can renumber the personal
+# VPN's tunnel), so a one-liner baked with today's name could restore ~2,200
+# routes onto tomorrow's *wrong* utun if run later. Instead it re-detects
+# the live interface, inline, at the moment the hint is actually run --
+# the same detect_utun_by_prefix() logic, reimplemented without depending
+# on this repo checkout still being at $SCRIPT_DIR (the hint may be copied
+# out and run somewhere else, e.g. after a reboot or a repo move).
 manual_restore_hint() {
-    echo "  while read -r dest gw; do case \"\$gw\" in utun*) sudo route -n -q add -net \"\$dest\" -interface \"\$gw\";; *) sudo route -n -q add -net \"\$dest\" \"\$gw\";; esac; done < $SAVED_ROUTES_FILE"
+    echo "  Manual restore -- re-detects the CURRENT personal-VPN utun (never reuse a name from a previous run):"
+    echo "    live_utun=\$(for i in \$(ifconfig -l | tr ' ' '\\n' | grep '^utun'); do case \"\$(ifconfig \"\$i\" 2>/dev/null | awk '/inet /{print \$2}')\" in ${PERSONAL_TUNNEL_PREFIX}*) echo \"\$i\"; break;; esac; done); [ -n \"\$live_utun\" ] || { echo 'no personal VPN utun found (prefix $PERSONAL_TUNNEL_PREFIX)' >&2; exit 1; }; while read -r dest gw; do case \"\$gw\" in utun*) sudo route -n -q add -net \"\$dest\" -interface \"\$live_utun\";; *) sudo route -n -q add -net \"\$dest\" \"\$gw\";; esac; done < \"$SAVED_ROUTES_FILE\""
 }
 
 # save_amnezia_routes IFACE -- write "destination gateway" pairs for every
@@ -121,6 +175,19 @@ manual_restore_hint() {
 # destination out of netstat's compact notation (see normalize_dest) so the
 # file on disk -- and the manual one-liner printed from it -- are
 # unambiguous.
+#
+# Only rows whose Gateway is the interface itself (an "-interface"-style
+# route, e.g. AmneziaVPN's own site routes) are saved. A row on this same
+# Netif whose Gateway is a literal address instead -- observed live as
+# exactly one row, where destination == gateway == the tunnel's own inet
+# address (the kernel's own point-to-point host route for the interface,
+# flag UH) -- is the kernel's, not Amnezia's: it was never installed by a
+# `route add -interface` call, restoring it with one would just recreate
+# what the kernel already owns, and deleting/re-adding it needlessly is
+# also why it used to be the one route a lift could never cleanly restore
+# (see the README/review this fixes). "default" is never saved either
+# (delete_amnezia_routes already refuses to touch it, so saving it would
+# only make the saved/expected counts dishonest -- see verify_restore).
 save_amnezia_routes() {
     iface=$1
     mkdir -p "$BUILD_DIR"
@@ -128,6 +195,11 @@ save_amnezia_routes() {
     netstat -rn -f inet 2>/dev/null | awk -v i="$iface" '$NF==i {print $1, $2}' |
     while read -r dest gw; do
         [ -z "$dest" ] && continue
+        [ "$dest" = "default" ] && continue
+        case "$gw" in
+            utun*) ;;
+            *) continue ;;
+        esac
         ndest=$(normalize_dest "$dest")
         echo "$ndest $gw" >>"$SAVED_ROUTES_FILE"
     done
@@ -146,9 +218,14 @@ save_amnezia_routes() {
 delete_amnezia_routes() {
     iface=$1
     if [ "$DRY_RUN" = 1 ]; then
-        netstat -rn -f inet 2>/dev/null | awk -v i="$iface" '$NF==i {print $1}' |
-        while read -r dest; do
+        netstat -rn -f inet 2>/dev/null | awk -v i="$iface" '$NF==i {print $1, $2}' |
+        while read -r dest gw; do
+            [ -z "$dest" ] && continue
             [ "$dest" = "default" ] && continue   # never touch the default route
+            case "$gw" in
+                utun*) ;;
+                *) continue ;;   # the kernel's own routes on this interface -- see save_amnezia_routes; never saved, so a live run never deletes them either
+            esac
             ndest=$(normalize_dest "$dest")
             # A dry-run keep-set preview (see compute_keep_set) writes here
             # for real before this runs -- skip anything it decided to
@@ -164,23 +241,35 @@ delete_amnezia_routes() {
     fi
     del_ok=0
     del_fail=0
+    del_skip=0
     del_fail_detail=""
     fail_cap=10
     while read -r dest _gw; do
         [ -z "$dest" ] && continue
         [ "$dest" = "default" ] && continue   # never touch the default route
-        err=$(sudo route -n -q delete -net "$dest" 2>&1 >/dev/null)
+        # Re-confirm the route's CURRENT interface is still the one it was
+        # saved from: something may have re-pointed this destination since
+        # save_amnezia_routes ran (a flap, a race with something else
+        # touching the table) -- deleting it here would then delete a route
+        # that now belongs to a different interface, purely by coincidence
+        # of destination.
+        cur_iface=$(route -n get -net "$dest" 2>/dev/null | awk '/interface:/{print $2}')
+        if [ "$cur_iface" != "$iface" ]; then
+            del_skip=$((del_skip + 1))
+            continue
+        fi
+        err=$($SUDO route -n -q delete -net "$dest" 2>&1 >/dev/null)
         rc=$?
         if [ "$rc" -eq 0 ]; then
             del_ok=$((del_ok + 1))
         else
             del_fail=$((del_fail + 1))
             if [ "$del_fail" -le "$fail_cap" ]; then
-                del_fail_detail="${del_fail_detail}    sudo route -n -q delete -net \"$dest\"  ->  ${err:-(no output, exit $rc)}\n"
+                del_fail_detail="${del_fail_detail}    $SUDO route -n -q delete -net \"$dest\"  ->  ${err:-(no output, exit $rc)}\n"
             fi
         fi
     done <"$SAVED_ROUTES_FILE"
-    echo "Deleted routes from $iface: $del_ok succeeded, $del_fail failed."
+    echo "Deleted routes from $iface: $del_ok succeeded, $del_fail failed, $del_skip skipped (interface changed since save)."
     if [ "$del_fail" -gt 0 ]; then
         printf '%b' "$del_fail_detail"
         [ "$del_fail" -gt "$fail_cap" ] && echo "  (showing first $fail_cap of $del_fail failures)"
@@ -207,17 +296,45 @@ restore_saved_routes() {
         fi
         netstat -rn -f inet 2>/dev/null | awk -v i="$AMNEZIA_UTUN_START" '$NF==i {print $1, $2}' |
         while read -r dest gw; do
-            ndest=$(normalize_dest "$dest")
+            [ -z "$dest" ] && continue
+            [ "$dest" = "default" ] && continue
             case "$gw" in
-                utun*) echo "  would run: sudo route -n -q add -net \"$ndest\" -interface \"$gw\"" ;;
-                *) echo "  would run: sudo route -n -q add -net \"$ndest\" \"$gw\"" ;;
+                "$AMNEZIA_UTUN_START") ;;   # Amnezia's own routes -- see save_amnezia_routes
+                *) continue ;;              # the kernel's own routes on this interface -- never saved, so never restored
             esac
+            ndest=$(normalize_dest "$dest")
+            # Mirror what a live run's SAVED_ROUTES_FILE would actually
+            # hold: a route never deleted in the first place (per the
+            # keep-set, if one is configured -- see compute_keep_set) has
+            # nothing to restore either.
+            if [ -n "${KEPT_ROUTES_FILE:-}" ] && [ -f "$KEPT_ROUTES_FILE" ] &&
+               awk -v d="$ndest" '$1==d{f=1} END{exit !f}' "$KEPT_ROUTES_FILE"; then
+                continue
+            fi
+            echo "  would run: sudo route -n -q add -net \"$ndest\" -interface \"$gw\""
         done
         return 0
     fi
     if [ ! -f "$SAVED_ROUTES_FILE" ]; then
         echo "  (no saved-routes file at $SAVED_ROUTES_FILE, nothing to restore)"
         return 0
+    fi
+    # utun numbers are not stable across sessions (a reconnect can renumber
+    # the personal VPN's tunnel) -- NEVER replay the gateway name recorded
+    # in SAVED_ROUTES_FILE as-is, since it may now name a different tunnel
+    # (or nothing at all). Re-detect the live interface once, up front, and
+    # use that name for every interface-route entry below; refuse outright
+    # if it is not present -- leaving routes lifted and saying so loudly is
+    # far better than guessing and installing ~2,200 personal routes onto
+    # whatever now happens to hold that old utun number.
+    live_utun=$(detect_utun_by_prefix "$PERSONAL_TUNNEL_PREFIX")
+    if [ -z "$live_utun" ]; then
+        echo
+        echo "ERROR: the personal VPN interface (prefix $PERSONAL_TUNNEL_PREFIX) is not present -- refusing to restore $SAVED_ROUTES_FILE onto a guessed/stale utun name." >&2
+        echo "Reconnect AmneziaVPN, then restore by hand once the tunnel is back:" >&2
+        manual_restore_hint >&2
+        RESTORE_HAD_FAILURES=1
+        return 1
     fi
     restore_ok=0
     restore_fail=0
@@ -227,12 +344,12 @@ restore_saved_routes() {
         [ -z "$dest" ] && continue
         case "$gw" in
             utun*)
-                cmd="sudo route -n -q add -net \"$dest\" -interface \"$gw\""
-                err=$(sudo route -n -q add -net "$dest" -interface "$gw" 2>&1 >/dev/null)
+                cmd="$SUDO route -n -q add -net \"$dest\" -interface \"$live_utun\""
+                err=$($SUDO route -n -q add -net "$dest" -interface "$live_utun" 2>&1 >/dev/null)
                 ;;
             *)
-                cmd="sudo route -n -q add -net \"$dest\" \"$gw\""
-                err=$(sudo route -n -q add -net "$dest" "$gw" 2>&1 >/dev/null)
+                cmd="$SUDO route -n -q add -net \"$dest\" \"$gw\""
+                err=$($SUDO route -n -q add -net "$dest" "$gw" 2>&1 >/dev/null)
                 ;;
         esac
         rc=$?
@@ -335,14 +452,18 @@ compute_keep_set() {
         return 0   # feature unused (missing/empty file) -- empty keep-set, not a failure
     fi
 
-    if ! command -v python3 >/dev/null 2>&1; then
-        echo "FATAL: $KEEP_ROUTES_FILE has $active_entries active entries but python3 is not available to compute the keep-set." >&2
+    # Pinned to the absolute system path, never a PATH-resolved "python3":
+    # this runs unattended as root under the installed LaunchDaemon, whose
+    # PATH is minimal/unspecified -- resolving by name would either find
+    # nothing or, worse, whatever a non-root user's PATH happened to expose.
+    if [ ! -x /usr/bin/python3 ]; then
+        echo "FATAL: $KEEP_ROUTES_FILE has $active_entries active entries but /usr/bin/python3 is not available to compute the keep-set." >&2
         return 1
     fi
 
     kept_out=$(mktemp) || { echo "FATAL: could not create a temp file to compute the keep-set" >&2; return 1; }
     err_out=$(mktemp) || { rm -f "$kept_out"; echo "FATAL: could not create a temp file to compute the keep-set" >&2; return 1; }
-    python3 "$KEEP_ROUTES_SCRIPT" compute "$KEEP_ROUTES_FILE" "$routes_file" >"$kept_out" 2>"$err_out"
+    /usr/bin/python3 "$KEEP_ROUTES_SCRIPT" compute "$KEEP_ROUTES_FILE" "$routes_file" >"$kept_out" 2>"$err_out"
     rc=$?
     if [ -s "$err_out" ]; then
         while IFS= read -r eline; do echo "$eline" >&2; done <"$err_out"

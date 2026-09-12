@@ -106,6 +106,7 @@ RESTORE_HAD_FAILURES=0    # set by restore_saved_routes on any failed route add
 RESTORE_VERIFY_FAILED=0   # set by verify_restore on a post-restore mismatch
 CONNECT_TIMED_OUT=0       # set when the corporate-VPN wait times out
 CORP_ALREADY_PRESENT=""   # "iface ip" if the corporate VPN was already up at startup
+SAVED_THIS_RUN=0          # set only once THIS run's own save_amnezia_routes has run -- see restore_personal_vpn
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -165,6 +166,10 @@ case "$TIMEOUT" in
         echo "ERROR: --timeout must be a positive integer, got '$TIMEOUT'" >&2
         exit 2
         ;;
+    0)
+        echo "ERROR: --timeout must be greater than 0, got '$TIMEOUT'" >&2
+        exit 2
+        ;;
 esac
 
 # normalize_dest, save_amnezia_routes, delete_amnezia_routes,
@@ -176,6 +181,24 @@ esac
 # RESTORE_HAD_FAILURES, RESTORE_VERIFY_FAILED, TUNNELS_FILE) -- see
 # lib-routes.sh's header comment for the exact contract.
 . "$SCRIPT_DIR/lib-routes.sh"
+
+# routes_restore_should_run -- true (0) when a live (non-dry-run) restore
+# for --method routes should actually touch SAVED_ROUTES_FILE this run:
+# only once THIS run's own save_amnezia_routes has actually run
+# (SAVED_THIS_RUN=1). A preview (--dry-run) always runs regardless, since
+# it never touches anything real. Defined here (before restore_personal_vpn,
+# and before the --self-test dispatch below) so --self-test can exercise
+# this decision directly -- see finding 8 in the review this fixes: the
+# "no personal-VPN utun found" refusal (in the bring-down case, below) exits
+# AFTER the EXIT trap is already armed, and without this guard that exit
+# would replay whatever SAVED_ROUTES_FILE happens to already be on disk
+# from a PREVIOUS successful run (this method deliberately leaves it there
+# as a historical record -- see the header), even though THIS run never
+# actually saved or deleted anything.
+routes_restore_should_run() {
+    [ "$DRY_RUN" = 1 ] && return 0
+    [ "$SAVED_THIS_RUN" = 1 ]
+}
 
 # --self-test: exercise normalize_dest against a fixed table of
 # inputs/expected outputs, independent of any config directory.
@@ -197,6 +220,190 @@ run_self_test() {
     test_case "1.1.1.1/32" "1.1.1.1/32"
     test_case "default" "default"
     test_case "172.16/12" "172.16.0.0/12"
+    # Finding 6: 2- and 3-octet no-slash forms (netstat drops the "/len"
+    # when it equals the classful default for that octet count) must be
+    # expanded, not passed through -- ipaddress.ip_network() in
+    # keep-routes.py rejects a bare "104.16"/"192.168.50" outright, so
+    # leaving them unexpanded made that route silently never matchable by
+    # the keep-routes feature.
+    test_case "104.16" "104.16.0.0/16"
+    test_case "192.168.50" "192.168.50.0/24"
+
+    # --- Finding 5(i) / Finding 10: save_amnezia_routes must keep only
+    # Amnezia's own interface-style routes (gw == the interface itself),
+    # skipping the kernel's own point-to-point host route on that same
+    # interface (dest==gw==the tunnel's own address, a literal IP, not the
+    # interface name) and "default" (never a candidate to save/delete/
+    # restore -- see delete_amnezia_routes). Subshell so the netstat()
+    # override below never leaks.
+    f5_result=$(
+        netstat() {
+            cat <<'ROWS'
+Routing tables
+
+Internet:
+Destination        Gateway            Flags               Netif Expire
+1.2.3.0/24          utun9              UGSc                  utun9
+10.9.9.9            10.9.9.9           UH                    utun9
+default             utun9              UGSc                  utun9
+ROWS
+        }
+        f5_dir=$(mktemp -d) || exit 1
+        trap 'rm -rf "$f5_dir"' EXIT
+        BUILD_DIR="$f5_dir"
+        SAVED_ROUTES_FILE="$f5_dir/saved.txt"
+        save_amnezia_routes utun9
+        cat "$SAVED_ROUTES_FILE"
+    )
+    if printf '%s\n' "$f5_result" | grep -qx '1.2.3.0/24 utun9' && \
+       ! printf '%s\n' "$f5_result" | grep -q '10\.9\.9\.9' && \
+       ! printf '%s\n' "$f5_result" | grep -q '^default'; then
+        echo "PASS  [finding 5i] save_amnezia_routes keeps Amnezia's interface routes, skips the kernel's own point-to-point host route"
+        echo "PASS  [finding 10] save_amnezia_routes never saves the default route"
+    else
+        echo "FAIL  [finding 5i/10] save_amnezia_routes result: $f5_result"
+        fail=1
+    fi
+
+    # --- Finding 5(i), dry-run preview: delete_amnezia_routes's own
+    # DRY_RUN branch must apply the same self-route/default exclusion as
+    # save_amnezia_routes -- a real run's SAVED_ROUTES_FILE would never
+    # contain either, so the preview must not claim it "would delete" them.
+    # Subshell so the netstat() override never leaks.
+    f5c_result=$(
+        netstat() {
+            cat <<'ROWS'
+Routing tables
+
+Internet:
+Destination        Gateway            Flags               Netif Expire
+1.2.3.0/24          utun9              UGSc                  utun9
+10.9.9.9            10.9.9.9           UH                    utun9
+default             utun9              UGSc                  utun9
+ROWS
+        }
+        DRY_RUN=1
+        delete_amnezia_routes utun9
+    )
+    if printf '%s\n' "$f5c_result" | grep -q 'delete -net "1.2.3.0/24"' && \
+       ! printf '%s\n' "$f5c_result" | grep -q '10\.9\.9\.9' && \
+       ! printf '%s\n' "$f5c_result" | grep -q 'default'; then
+        echo "PASS  [finding 5i] delete_amnezia_routes's dry-run preview also skips the kernel's own point-to-point host route and default"
+    else
+        echo "FAIL  [finding 5i] delete_amnezia_routes dry-run preview: $f5c_result"
+        fail=1
+    fi
+
+    # --- Finding 8: restore_personal_vpn's "routes" branch must not
+    # replay a stale SAVED_ROUTES_FILE left on disk by a PREVIOUS run when
+    # THIS run never actually saved anything.
+    f8_dir=$(mktemp -d) || { echo "FAIL  [finding 8] could not create temp dir" >&2; fail=1; f8_dir=""; }
+    if [ -n "$f8_dir" ]; then
+        SAVED_ROUTES_FILE="$f8_dir/saved.txt"
+        DRY_RUN=0
+        printf '10.9.9.0/24 utun9\n' >"$SAVED_ROUTES_FILE"   # stale file "from last week"
+        SAVED_THIS_RUN=0
+        if routes_restore_should_run; then
+            echo "FAIL  [finding 8] routes_restore_should_run said yes when nothing was saved this run"
+            fail=1
+        else
+            echo "PASS  [finding 8] routes_restore_should_run refuses to touch a stale saved-routes file when nothing was saved this run"
+        fi
+        SAVED_THIS_RUN=1
+        if routes_restore_should_run; then
+            echo "PASS  [finding 8] routes_restore_should_run allows the restore once this run's own save actually happened"
+        else
+            echo "FAIL  [finding 8] routes_restore_should_run refused even though this run did save"
+            fail=1
+        fi
+        rm -rf "$f8_dir"
+    fi
+
+    # --- Finding 9: delete_amnezia_routes must re-check each route's
+    # CURRENT interface before deleting it -- skip and count a mismatch
+    # rather than delete a route that, by now, belongs to someone else.
+    # Plain "( ) >file" subshell (NOT "$(...)") so the route()/sudo()
+    # overrides never leak and no real `route get`/`route delete` is ever
+    # invoked -- a case statement defined inline inside a "$(...)" command
+    # substitution mis-parses on this platform's /bin/sh (bash 3.2's
+    # long-standing case-in-command-substitution parser bug), so the
+    # override function bodies are exercised via output redirection
+    # instead of output capture.
+    f9_dir=$(mktemp -d) || { echo "FAIL  [finding 9] could not create temp dir" >&2; fail=1; f9_dir=""; }
+    if [ -n "$f9_dir" ]; then
+        f9_outfile="$f9_dir/out"
+        (
+            route() {
+                case "$*" in
+                    *"10.1.1.0/24"*) echo "   interface: utun42" ;;
+                    *) echo "   interface: en0" ;;
+                esac
+            }
+            sudo() { return 0; }
+            SAVED_ROUTES_FILE="$f9_dir/saved.txt"
+            printf '10.1.1.0/24 utun42\n10.2.2.0/24 utun42\n' >"$SAVED_ROUTES_FILE"
+            DRY_RUN=0
+            delete_amnezia_routes utun42
+        ) >"$f9_outfile" 2>&1
+        f9_out=$(cat "$f9_outfile")
+        if printf '%s\n' "$f9_out" | grep -q '1 succeeded, 0 failed, 1 skipped'; then
+            echo "PASS  [finding 9] delete_amnezia_routes skips a route whose current interface no longer matches"
+        else
+            echo "FAIL  [finding 9] delete_amnezia_routes output: $f9_out"
+            fail=1
+        fi
+        rm -rf "$f9_dir"
+    fi
+
+    # --- Finding 14: compute_keep_set must invoke /usr/bin/python3
+    # directly, never a PATH-resolved "python3". Subshell so the fake PATH
+    # entry never leaks.
+    if [ "$SUDO" = "sudo" ]; then
+        echo "PASS  [finding 14] lib-routes.sh's \$SUDO is 'sudo' when not running as root"
+    else
+        echo "FAIL  [finding 14] \$SUDO='$SUDO' while not root (expected 'sudo')"
+        fail=1
+    fi
+    if (
+        f14_dir=$(mktemp -d) || exit 1
+        trap 'rm -rf "$f14_dir"' EXIT
+        cat >"$f14_dir/python3" <<'EOF'
+#!/bin/sh
+echo "FAKE-PYTHON-RAN" >&2
+exit 1
+EOF
+        chmod +x "$f14_dir/python3"
+        PATH="$f14_dir:$PATH"
+        export PATH
+        KEEP_ROUTES_FILE="$f14_dir/keep.txt"
+        KEEP_ROUTES_SCRIPT="$SCRIPT_DIR/keep-routes.py"
+        KEPT_ROUTES_FILE="$f14_dir/kept.txt"
+        routes_file="$f14_dir/routes.txt"
+        printf '1.2.3.0/24 utun9\n' >"$routes_file"
+        printf '1.2.3.0/24\n' >"$KEEP_ROUTES_FILE"
+        out=$(compute_keep_set "$routes_file" 2>&1)
+        if printf '%s' "$out" | grep -q "FAKE-PYTHON-RAN"; then
+            echo "FAIL  [finding 14] compute_keep_set ran a PATH-shadowed python3 instead of /usr/bin/python3"
+            exit 1
+        else
+            echo "PASS  [finding 14] compute_keep_set invokes /usr/bin/python3 directly, ignoring a shadowing PATH entry"
+        fi
+    ); then
+        :
+    else
+        fail=1
+    fi
+
+    # --- Finding 16: reject --timeout 0.
+    f16_out=$("$0" --timeout 0 --dry-run 2>&1)
+    f16_rc=$?
+    if [ "$f16_rc" -ne 0 ] && printf '%s' "$f16_out" | grep -qi 'timeout'; then
+        echo "PASS  [finding 16] --timeout 0 is rejected"
+    else
+        echo "FAIL  [finding 16] --timeout 0 -> rc=$f16_rc out='$f16_out' (expected a rejection)"
+        fail=1
+    fi
+
     if [ "$fail" = 0 ]; then
         echo "self-test: all cases PASS"
     else
@@ -532,6 +739,10 @@ restore_personal_vpn() {
             [ "$DRY_RUN" = 1 ] || wait_for_utun_present "$PERSONAL_TUNNEL_PREFIX" "$TIMEOUT" "the personal VPN interface"
             ;;
         routes)
+            if ! routes_restore_should_run; then
+                echo "  (nothing was saved this run -- not touching any existing $SAVED_ROUTES_FILE)"
+                return 0
+            fi
             restore_saved_routes
             verify_restore
             ;;
@@ -589,6 +800,7 @@ case "$METHOD" in
             # the same kept routes; cleaned up once that preview is done.
         else
             save_amnezia_routes "$AMNEZIA_UTUN_START"
+            SAVED_THIS_RUN=1
             echo "Saved $(wc -l <"$SAVED_ROUTES_FILE" | tr -d ' ') routes to $SAVED_ROUTES_FILE."
             if compute_keep_set "$SAVED_ROUTES_FILE"; then
                 if [ -s "$KEPT_ROUTES_FILE" ]; then
@@ -604,7 +816,13 @@ case "$METHOD" in
         if [ "$ROUTES_SKIP_DELETE" = 0 ]; then
             delete_amnezia_routes "$AMNEZIA_UTUN_START"
         fi
-        [ "$DRY_RUN" = 1 ] && rm -f "$KEPT_ROUTES_FILE"
+        # KEPT_ROUTES_FILE (--dry-run only -- a real run's already exists as
+        # part of SAVED_ROUTES_FILE's own bookkeeping and is cleaned up by
+        # verify_restore's caller elsewhere) is deliberately NOT removed
+        # here: restore_personal_vpn's own dry-run preview, called near the
+        # end of this script, also needs it to exclude the same kept routes
+        # from "would restore" -- see its own comment. Removed once that
+        # preview has run too (bottom of this script).
         ;;
     launchd)
         launchd_down
@@ -649,6 +867,7 @@ else
 fi
 
 restore_personal_vpn
+[ "$METHOD" = "routes" ] && [ "$DRY_RUN" = 1 ] && rm -f "$KEPT_ROUTES_FILE"
 AFTER_TOTAL=$(route_count)
 
 echo

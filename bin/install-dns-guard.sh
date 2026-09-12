@@ -124,6 +124,13 @@ assert_safe_path() {
     done
 }
 
+# safe_install SRC DST -- install SRC as DST atomically: copy next to DST,
+# then rename over it, so a reader (a LaunchDaemon that could fire mid-
+# install) never observes a partially-written file.
+safe_install() {
+    sudo cp "$1" "$2.new" && sudo mv "$2.new" "$2"
+}
+
 if [ "$ACTION" = "uninstall" ]; then
     echo "Uninstalling $PLIST_LABEL"
     sudo launchctl bootout "system/$PLIST_LABEL" 2>/dev/null || true
@@ -277,9 +284,9 @@ fi
 # requires sudo -- never run it from an automated/non-interactive context
 # that isn't explicitly the human operator invoking --apply themselves.
 sudo mkdir -p "$LIB_DIR"
-sudo cp "$GUARD_SCRIPT_SRC" "$GUARD_SCRIPT_DST"
-sudo cp "$TMP_CONF" "$GUARD_CONF_DST"
-sudo cp "$TMP_PLIST" "$PLIST_DST"
+safe_install "$GUARD_SCRIPT_SRC" "$GUARD_SCRIPT_DST"
+safe_install "$TMP_CONF" "$GUARD_CONF_DST"
+safe_install "$TMP_PLIST" "$PLIST_DST"
 
 sudo chown root:wheel "$GUARD_SCRIPT_DST" "$GUARD_CONF_DST" "$PLIST_DST"
 sudo chmod 755 "$GUARD_SCRIPT_DST"

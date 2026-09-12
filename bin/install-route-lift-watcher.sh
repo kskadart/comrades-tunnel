@@ -39,7 +39,7 @@
 # --apply performs the install with sudo and (re)loads the daemon.
 # --uninstall stops the daemon and removes the installed files.
 #
-# Usage: install-route-lift-watcher.sh [--config DIR] [--dry-run|--apply|--uninstall]
+# Usage: install-route-lift-watcher.sh [--config DIR] [--dry-run|--apply|--uninstall|--self-test]
 
 set -eu
 
@@ -48,6 +48,7 @@ REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 
 CONFIG_DIR="$REPO_ROOT/local"
 ACTION="dry-run"
+SELF_TEST=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -71,12 +72,65 @@ while [ $# -gt 0 ]; do
             ACTION="uninstall"
             shift
             ;;
+        --self-test)
+            SELF_TEST=1
+            shift
+            ;;
         *)
-            echo "Usage: $0 [--config DIR] [--dry-run|--apply|--uninstall]" >&2
+            echo "Usage: $0 [--config DIR] [--dry-run|--apply|--uninstall|--self-test]" >&2
             exit 2
             ;;
     esac
 done
+
+# saved_routes_blocks_uninstall MARKER -- true (0) if MARKER exists (the
+# personal VPN's routes may currently be lifted and --uninstall must
+# refuse), false (1) otherwise. Factored out so --self-test can exercise
+# the decision without sudo or any real system path -- see finding 4 in
+# the review this fixes.
+saved_routes_blocks_uninstall() {
+    [ -f "$1" ]
+}
+
+# safe_install SRC DST -- install SRC as DST atomically: copy next to DST,
+# then rename over it, so a reader (a LaunchDaemon that could fire mid-
+# install) never observes a partially-written file.
+safe_install() {
+    sudo cp "$1" "$2.new" && sudo mv "$2.new" "$2"
+}
+
+run_self_test() {
+    fail=0
+    t=$(mktemp -d) || { echo "FAIL  could not create a temp dir" >&2; return 1; }
+    trap 'rm -rf "$t"' EXIT
+
+    if saved_routes_blocks_uninstall "$t/does-not-exist"; then
+        echo "FAIL  [finding 4] saved_routes_blocks_uninstall said yes for a marker that does not exist"
+        fail=1
+    else
+        echo "PASS  [finding 4] saved_routes_blocks_uninstall says no when no saved-routes marker exists"
+    fi
+
+    printf '10.9.9.0/24 utun9\n' >"$t/marker"
+    if saved_routes_blocks_uninstall "$t/marker"; then
+        echo "PASS  [finding 4] saved_routes_blocks_uninstall says yes when a saved-routes marker is present (routes may be lifted)"
+    else
+        echo "FAIL  [finding 4] saved_routes_blocks_uninstall said no for an existing marker"
+        fail=1
+    fi
+
+    if [ "$fail" = 0 ]; then
+        echo "self-test: all cases PASS"
+    else
+        echo "self-test: at least one case FAILED" >&2
+    fi
+    return "$fail"
+}
+
+if [ "$SELF_TEST" = 1 ]; then
+    run_self_test
+    exit $?
+fi
 
 LIB_DIR="/Library/Application Support/comrades-tunnel"
 WATCHER_SRC="$SCRIPT_DIR/route-lift-watcher.sh"
@@ -93,8 +147,14 @@ PLIST_DST="/Library/LaunchDaemons/$PLIST_LABEL.plist"
 LOG_FILE="/var/log/comrades-tunnel-route-lift.log"
 HELPDESK_LOG="/Library/Application Support/Checkpoint/Endpoint Connect/helpdesk.log"
 STATE_DIR="$LIB_DIR/route-lift-state"
+# Same filename route-lift-watcher.sh's own SAVED_ROUTES_FILE resolves to
+# under this installed STATE_DIR -- its presence means the personal VPN's
+# routes may currently be lifted (see the --uninstall guard below).
+SAVED_ROUTES_MARKER="$STATE_DIR/route-lift-saved-routes.txt"
+NEWSYSLOG_DST="/etc/newsyslog.d/comrades-tunnel-route-lift.conf"
 TIMEOUT=240
 SAFETY_NET_INTERVAL=60
+EXIT_TIMEOUT=300   # generous: a real restore can take a few seconds; never let launchd SIGKILL it mid-write (finding 4)
 
 # Verify that <path> and every already-existing ancestor up to / is fully
 # root-owned with neither group-write nor other-write permission. Directory
@@ -128,9 +188,19 @@ assert_safe_path() {
 }
 
 if [ "$ACTION" = "uninstall" ]; then
+    if saved_routes_blocks_uninstall "$SAVED_ROUTES_MARKER"; then
+        echo "ERROR: $SAVED_ROUTES_MARKER exists -- the personal VPN's routes may currently be lifted." >&2
+        echo "Uninstalling now would delete the only record of what to restore, and launchd's bootout" >&2
+        echo "can SIGKILL a restore already in progress before it finishes. Run the installed watcher" >&2
+        echo "once first (a normal invocation restores), confirm with --status that routes are back," >&2
+        echo "then re-run --uninstall:" >&2
+        echo "  sudo sh \"$WATCHER_DST\"" >&2
+        echo "  sh \"$WATCHER_DST\" --status" >&2
+        exit 1
+    fi
     echo "Uninstalling $PLIST_LABEL"
     sudo launchctl bootout "system/$PLIST_LABEL" 2>/dev/null || true
-    for f in "$PLIST_DST" "$WATCHER_DST" "$LIBROUTES_DST" "$KEEPROUTES_DST" "$KEEPFILE_DST" "$CONF_DST"; do
+    for f in "$PLIST_DST" "$WATCHER_DST" "$LIBROUTES_DST" "$KEEPROUTES_DST" "$KEEPFILE_DST" "$CONF_DST" "$NEWSYSLOG_DST"; do
         if [ -e "$f" ]; then
             sudo rm -f "$f"
             echo "Removed: $f"
@@ -189,10 +259,12 @@ echo "Checking path safety:"
 assert_safe_path "$LIB_DIR"
 assert_safe_path "$(dirname "$PLIST_DST")"
 assert_safe_path "$(dirname "$LOG_FILE")"
+assert_safe_path "$(dirname "$NEWSYSLOG_DST")"
 
 TMP_CONF=$(mktemp)
 TMP_PLIST=$(mktemp)
-trap 'rm -f "$TMP_CONF" "$TMP_PLIST"' EXIT
+TMP_NEWSYSLOG=$(mktemp)
+trap 'rm -f "$TMP_CONF" "$TMP_PLIST" "$TMP_NEWSYSLOG"' EXIT
 
 cat >"$TMP_CONF" <<EOF
 PERSONAL_TUNNEL_PREFIX=$PERSONAL_TUNNEL_PREFIX
@@ -224,12 +296,21 @@ cat >"$TMP_PLIST" <<EOF
 	<false/>
 	<key>ThrottleInterval</key>
 	<integer>2</integer>
+	<key>ExitTimeOut</key>
+	<integer>$EXIT_TIMEOUT</integer>
 	<key>StandardOutPath</key>
 	<string>$LOG_FILE</string>
 	<key>StandardErrorPath</key>
 	<string>$LOG_FILE</string>
 </dict>
 </plist>
+EOF
+
+# newsyslog.d entry: this daemon's log() always appends and never rotates
+# itself (see route-lift-watcher.sh), so without this it grows forever.
+cat >"$TMP_NEWSYSLOG" <<EOF
+# logfilename                              [owner:group]  mode count size(KB) when  flags
+$LOG_FILE	root:wheel	644	7	1000	*	J
 EOF
 
 echo "Config dir: $CONFIG_DIR"
@@ -321,6 +402,20 @@ else
 fi
 echo
 
+echo "=== $NEWSYSLOG_DST ==="
+echo "--- rendered content ---"
+cat "$TMP_NEWSYSLOG"
+if [ -f "$NEWSYSLOG_DST" ]; then
+    if diff -u "$NEWSYSLOG_DST" "$TMP_NEWSYSLOG"; then
+        echo "--- diff against installed file: none (up to date) ---"
+    else
+        echo "--- diff against installed file above ($NEWSYSLOG_DST -> rendered) ---"
+    fi
+else
+    echo "--- installed file: none, would create $NEWSYSLOG_DST ---"
+fi
+echo
+
 if [ "$ACTION" = "dry-run" ]; then
     echo "dry-run: no changes made. Re-run with --apply (sudo) to install."
     exit 0
@@ -330,18 +425,19 @@ fi
 # requires sudo -- never run it from an automated/non-interactive context
 # that isn't explicitly the human operator invoking --apply themselves.
 sudo mkdir -p "$LIB_DIR" "$STATE_DIR"
-sudo cp "$WATCHER_SRC" "$WATCHER_DST"
-sudo cp "$LIBROUTES_SRC" "$LIBROUTES_DST"
-sudo cp "$KEEPROUTES_SRC" "$KEEPROUTES_DST"
-sudo cp "$TMP_CONF" "$CONF_DST"
-sudo cp "$TMP_PLIST" "$PLIST_DST"
+safe_install "$WATCHER_SRC" "$WATCHER_DST"
+safe_install "$LIBROUTES_SRC" "$LIBROUTES_DST"
+safe_install "$KEEPROUTES_SRC" "$KEEPROUTES_DST"
+safe_install "$TMP_CONF" "$CONF_DST"
+safe_install "$TMP_PLIST" "$PLIST_DST"
+safe_install "$TMP_NEWSYSLOG" "$NEWSYSLOG_DST"
 if [ -f "$KEEPFILE_SRC" ]; then
-    sudo cp "$KEEPFILE_SRC" "$KEEPFILE_DST"
+    safe_install "$KEEPFILE_SRC" "$KEEPFILE_DST"
 fi
 
-sudo chown root:wheel "$WATCHER_DST" "$LIBROUTES_DST" "$KEEPROUTES_DST" "$CONF_DST" "$PLIST_DST" "$STATE_DIR"
+sudo chown root:wheel "$WATCHER_DST" "$LIBROUTES_DST" "$KEEPROUTES_DST" "$CONF_DST" "$PLIST_DST" "$NEWSYSLOG_DST" "$STATE_DIR"
 sudo chmod 755 "$WATCHER_DST" "$LIBROUTES_DST" "$KEEPROUTES_DST"
-sudo chmod 644 "$CONF_DST" "$PLIST_DST"
+sudo chmod 644 "$CONF_DST" "$PLIST_DST" "$NEWSYSLOG_DST"
 sudo chmod 755 "$STATE_DIR"
 if [ -f "$KEEPFILE_DST" ]; then
     sudo chown root:wheel "$KEEPFILE_DST"
