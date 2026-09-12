@@ -553,6 +553,27 @@ make health-uninstall    # выгрузить и удалить LaunchAgent
 
 Лог: `~/Library/Logs/comrades-tunnel-split-health.log`.
 
+## Веб-UI для логов и состояния: bin/logs-ui.py
+
+Локальная страница вместо ручного чтения трёх логов и файлов состояния:
+сводка (корпоративный/личный `utun`, число маршрутов, режим сплита из
+`local/split-mode.txt`, загружены ли три launchd-задачи), таблица
+состояний `bin/split-health.sh` и три лог-пейна (`dns-guard`, `route-lift`,
+`split-health`) с фильтром и подсветкой ERROR/FAIL/WARNING. Полностью
+read-only, слушает только `127.0.0.1:8765`, страница опрашивает
+`/api/state` раз в 10 секунд.
+
+```
+make logs-ui              # запустить на переднем плане, откроется на http://127.0.0.1:8765/
+make logs-ui-install      # установить и загрузить LaunchAgent (без sudo)
+make logs-ui-uninstall    # выгрузить и удалить LaunchAgent
+```
+
+`/var/log/comrades-tunnel-dns-guard.log` и `-route-lift.log` пишет root; если
+они не world-readable, страница вместо содержимого покажет точную команду
+`sudo chmod 644 <path>` — её нужно выполнить вручную, сам скрипт sudo не
+вызывает.
+
 ## Ограничения
 
 - Только IPv4 — разбиение по сайтам в Amnezia не поддерживает IPv6, поэтому
@@ -587,6 +608,8 @@ bin/
   keep-routes.py         резолвинг keep-routes-for.txt и проверка вхождения в CIDR (общий для cp-connect.sh/route-lift-watcher.sh)
   split-health.sh        периодический монитор разбиения, уведомляет в Telegram при смене статуса
   install-split-health.sh   установка split-health.sh как LaunchAgent пользовательской сессии
+  logs-ui.py             локальная read-only веб-страница для логов и состояния (127.0.0.1 only)
+  install-logs-ui.sh     установка logs-ui.py как LaunchAgent пользовательской сессии
 config/
   example/               шаблон конфигурации (плейсхолдеры, безопасно коммитить)
   presets/                готовые списки, например direct-domains.ru-popular.txt

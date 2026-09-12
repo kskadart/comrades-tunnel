@@ -24,6 +24,10 @@ MAX_SITES_FLAG = $(if $(MAX_SITES),--max-sites $(MAX_SITES),)
 # MINUTES=90. Default 60, capped by the watcher itself at 480 (8h).
 MINUTES ?= 60
 
+# Port for the local logs/state web UI (bin/logs-ui.py): make logs-ui
+# LOGS_UI_PORT=8888. It always binds to 127.0.0.1 only.
+LOGS_UI_PORT ?= 8765
+
 # Path route-lift-pause/route-lift-resume operate on: the INSTALLED copy of
 # the watcher (not bin/route-lift-watcher.sh), because only that copy has
 # the co-located route-lift.conf that resolves the real, running daemon's
@@ -148,6 +152,20 @@ health-uninstall: ## Stop and remove the split-health LaunchAgent (no sudo)
 .PHONY: health-test-telegram
 health-test-telegram: ## Send exactly one test Telegram message via the monitor's own credentials
 	@sh "$(ROOT)/bin/split-health.sh" --config "$(CONFIG)" --test-telegram
+
+##@ Logs UI
+.PHONY: logs-ui
+logs-ui: ## Run the local logs web UI in the foreground and print its URL
+	@echo "Open http://127.0.0.1:$(LOGS_UI_PORT)/ in your browser (Ctrl-C to stop)."
+	@python3 "$(ROOT)/bin/logs-ui.py" --port $(LOGS_UI_PORT)
+
+.PHONY: logs-ui-install
+logs-ui-install: ## Install and load the logs-ui LaunchAgent (no sudo)
+	@sh "$(ROOT)/bin/install-logs-ui.sh" --port $(LOGS_UI_PORT) --apply
+
+.PHONY: logs-ui-uninstall
+logs-ui-uninstall: ## Stop and remove the logs-ui LaunchAgent (no sudo)
+	@sh "$(ROOT)/bin/install-logs-ui.sh" --uninstall
 
 ##@ Corporate VPN connect
 .PHONY: cp-connect
