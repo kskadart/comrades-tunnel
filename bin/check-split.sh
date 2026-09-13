@@ -10,6 +10,14 @@
 #   - egress IP via the default route vs. forced out en0
 #   - route counts per utun interface
 #
+# corp-hosts-check.txt lookups use dscacheutil_bounded (a hard 3s wall-clock
+# cap, see that function) rather than a bare dscacheutil call: dscacheutil
+# honors /etc/resolver/<zone>, so with the corporate VPN down its configured
+# (unreachable) resolver used to make the whole run take ~118s for 5 hosts
+# (long per-host retries) instead of a few seconds; `dig` is still tried as
+# a fallback exactly as before, and the PASS/FAIL table's behaviour is
+# otherwise unchanged.
+#
 # --mode selects which AmneziaVPN split-tunneling mode is being checked
 # against (mirrors bin/gen-amnezia-sites.py --mode): 'forward' (default,
 # unchanged) expects excluded destinations to merely NOT be the personal
@@ -85,6 +93,32 @@ esac
 read_lines() {
     [ -f "$1" ] || return 0
     sed -e 's/#.*$//' "$1" | sed -e 's/[[:space:]]*$//' | grep -v '^[[:space:]]*$'
+}
+
+# dscacheutil_bounded HOST -- same query as `dscacheutil -q host -a name
+# HOST`, hard-capped at DSCACHEUTIL_TIMEOUT_SECONDS wall-clock seconds.
+# macOS has no timeout(1): this backgrounds the command directly (so $! is
+# its own pid, not a wrapping subshell's) and races it against a watchdog
+# that kills it after the bound. Needed because dscacheutil, unlike `dig`,
+# honors /etc/resolver/<zone> -- with the corporate VPN down, a
+# corporate-zone host's configured resolver is unreachable and the system
+# resolver retries it for a long time (measured: ~118s total for this
+# script's whole run against 5 corp-hosts-check.txt entries); bounding it
+# preserves that resolver awareness (the caller still falls back to dig on
+# top) without hanging. Same helper as bin/split-health.sh's own.
+DSCACHEUTIL_TIMEOUT_SECONDS=3
+dscacheutil_bounded() {
+    host=$1
+    out=$(mktemp) || return 1
+    dscacheutil -q host -a name "$host" >"$out" 2>/dev/null &
+    cmd_pid=$!
+    ( sleep "$DSCACHEUTIL_TIMEOUT_SECONDS"; kill -TERM "$cmd_pid" 2>/dev/null ) &
+    watchdog_pid=$!
+    wait "$cmd_pid" 2>/dev/null
+    kill "$watchdog_pid" 2>/dev/null
+    wait "$watchdog_pid" 2>/dev/null
+    awk '/^ip_address:/{print $2; exit}' "$out"
+    rm -f "$out"
 }
 
 FAIL_COUNT=0
@@ -179,7 +213,7 @@ if [ -z "$HOSTS" ]; then
 fi
 
 for host in $HOSTS; do
-    dscache_ip=$(dscacheutil -q host -a name "$host" 2>/dev/null | awk '/^ip_address:/{print $2; exit}')
+    dscache_ip=$(dscacheutil_bounded "$host")
     dig_ip=$(dig +short +time=2 +tries=1 A "$host" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
     test_ip=${dscache_ip:-$dig_ip}
 

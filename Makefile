@@ -149,6 +149,10 @@ health: ## Dry-run: what the split-tunnel health monitor would report/send right
 health-status: ## Show the monitor's last reported state per check and recent log lines
 	@sh "$(ROOT)/bin/split-health.sh" --config "$(CONFIG)" --status
 
+.PHONY: health-run-once
+health-run-once: ## Run one split-health tick in the foreground (no daemon), for testing
+	@sh "$(ROOT)/bin/split-health.sh" --config "$(CONFIG)"
+
 .PHONY: health-install
 health-install: ## Install and load the split-health LaunchAgent (no sudo)
 	@sh "$(ROOT)/bin/install-split-health.sh" --config "$(CONFIG)" --apply

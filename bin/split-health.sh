@@ -64,7 +64,13 @@
 #       announced-prefix set as a whole). Bounded to 420s (measured: a real
 #       --refresh run against ~30 direct-domains.txt entries took 3m51s); a
 #       timeout or generator failure reports INFO, not WARN, and still
-#       counts as this week's attempt.
+#       counts as this week's attempt. Never due on a fresh install: with no
+#       persisted timestamp yet, this tick seeds one at NOW and skips (INFO,
+#       "first registry diff in 7 days") instead of running the ~4-minute
+#       refresh immediately -- and even once 7 days have passed, it stays
+#       skipped unless SITES_FILE exists and is at least 1 day old (a list
+#       generated today cannot have drifted yet). --force-registry-diff
+#       overrides both gates for a manual run.
 #   5c. IMPORT_MISMATCH, every tick -- compares the generated file for the
 #       current MODE against what AmneziaVPN currently has imported, read
 #       read-only from ~/Library/Preferences/org.amneziavpn.AmneziaVPN.plist
@@ -100,12 +106,25 @@
 # Usage: split-health.sh [--config DIR] [--gateway-mode {direct,tunnel}]
 #                         [--stale-days N] [--dry-run] [--status]
 #                         [--test-telegram] [--self-test]
+#                         [--force-registry-diff]
 # With no mode flag, this performs a real run: checks, updates state,
 # sends Telegram per the policy above, and appends one log line. Exit code
 # is always 0 in that mode (a LaunchAgent tick must never look like a
 # crash); --dry-run/--status/--test-telegram also exit 0 except on a usage
 # error (2). --self-test runs fully offline against synthetic data (no
 # network, no real config/plist) and exits 0 only if every case PASSes.
+# --force-registry-diff makes 5b (REGISTRY_DIFF) due unconditionally, for a
+# manual on-demand check, and works with --dry-run or a real run alike.
+#
+# --status is a pure read: it only reads STATE_DIR and the last 10 lines of
+# LOG_FILE and prints them (plus whether a tick currently holds the lock
+# below) -- no DNS resolution, no route/ifconfig/plist inspection, no lock
+# acquisition, nothing that can block. A normal tick (no mode flag) takes a
+# single-instance mkdir-based lock under STATE_DIR before doing any of that
+# work (same pattern as bin/route-lift-watcher.sh's acquire_lock: broken
+# only when the recorded owner pid is dead); a second tick that finds the
+# lock held logs one line and exits 0 immediately instead of racing the
+# first. --dry-run and --status never take this lock.
 
 set -u
 
@@ -122,6 +141,7 @@ DRY_RUN=0
 STATUS=0
 TEST_TELEGRAM=0
 SELF_TEST=0
+FORCE_REGISTRY_DIFF=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -135,8 +155,9 @@ while [ $# -gt 0 ]; do
         --status) STATUS=1; shift ;;
         --test-telegram) TEST_TELEGRAM=1; shift ;;
         --self-test) SELF_TEST=1; shift ;;
+        --force-registry-diff) FORCE_REGISTRY_DIFF=1; shift ;;
         *)
-            echo "Usage: $0 [--config DIR] [--gateway-mode {direct,tunnel}] [--stale-days N] [--dry-run] [--status] [--test-telegram] [--self-test]" >&2
+            echo "Usage: $0 [--config DIR] [--gateway-mode {direct,tunnel}] [--stale-days N] [--dry-run] [--status] [--test-telegram] [--self-test] [--force-registry-diff]" >&2
             exit 2
             ;;
     esac
@@ -151,10 +172,27 @@ case "$GATEWAY_MODE" in
 esac
 
 STATE_DIR="$HOME/Library/Application Support/comrades-tunnel/split-health-state"
+LOCK_DIR="$STATE_DIR/lock"
 LOG_FILE="$HOME/Library/Logs/comrades-tunnel-split-health.log"
 PLIST_LABEL="dev.comrades-tunnel.split-health"
 NOW=$(date +%s)
 FAIL_RENOTIFY_SECONDS=$((6 * 3600))
+
+# REGISTRY_DIFF (5b) tunables -- see that check's own comment below for the
+# full rationale; defined here (not inline) so --self-test can exercise the
+# same due-date logic via registry_diff_is_due() before CONFIG_DIR/MODE are
+# even resolved.
+REGISTRY_DIFF_LAST_RUN_FILE="$STATE_DIR/registry-diff-last-run"
+REGISTRY_DIFF_INTERVAL_SECONDS=$((7 * 24 * 3600))
+REGISTRY_DIFF_TIMEOUT_SECONDS=420
+REGISTRY_DIFF_MIN_LIST_AGE_SECONDS=$((1 * 24 * 3600))
+
+# Single-instance tick lock (see acquire_lock/release_lock_if_held below).
+# LOCK_STALE_NO_PID_SECONDS only matters for a lock directory with no pid
+# file at all (should not happen with this code -- kept for parity with
+# bin/route-lift-watcher.sh's own fallback); comfortably above the longest
+# a legitimate tick can run (REGISTRY_DIFF_TIMEOUT_SECONDS plus slack).
+LOCK_STALE_NO_PID_SECONDS=$((REGISTRY_DIFF_TIMEOUT_SECONDS + 180))
 
 # --- small helpers (deliberately duplicated from check-split.sh/dns-guard.sh
 # rather than factored further -- same convention those two already follow
@@ -173,6 +211,89 @@ NL='
 
 route_iface() {
     route -n get "$1" 2>/dev/null | awk '/interface:/{print $2}'
+}
+
+# age_seconds PATH -- seconds since PATH's mtime, or empty if PATH does not
+# exist / stat fails. Same helper as bin/route-lift-watcher.sh's own.
+age_seconds() {
+    mtime=$(stat -f '%m' "$1" 2>/dev/null) || return 1
+    echo $(( $(date +%s) - mtime ))
+}
+
+# acquire_lock / release_lock_if_held -- mkdir-based single-instance lock
+# for the normal tick path only (never --dry-run/--status/--test-telegram/
+# --self-test), POSIX, no bashisms -- same pattern as
+# bin/route-lift-watcher.sh's acquire_lock: a lock's true owner is the pid
+# recorded in it, not its age, so it is broken only when that pid is
+# provably dead (`kill -0` fails); the age-only fallback only applies to a
+# lock directory with no pid file at all (should not happen with this
+# code -- kept only for parity/self-test coverage).
+TICK_LOCK_HELD=0
+acquire_lock() {
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        echo $$ >"$LOCK_DIR/pid" 2>/dev/null
+        return 0
+    fi
+    lock_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+    case "$lock_pid" in
+        ''|*[!0-9]*)
+            lock_age=$(age_seconds "$LOCK_DIR")
+            if [ -n "$lock_age" ] && [ "$lock_age" -gt "$LOCK_STALE_NO_PID_SECONDS" ]; then
+                rm -f "$LOCK_DIR/pid" 2>/dev/null
+                rmdir "$LOCK_DIR" 2>/dev/null
+                if mkdir "$LOCK_DIR" 2>/dev/null; then
+                    echo $$ >"$LOCK_DIR/pid" 2>/dev/null
+                    return 0
+                fi
+            fi
+            ;;
+        *)
+            if kill -0 "$lock_pid" 2>/dev/null; then
+                return 1   # owner is alive -- never break this lock, regardless of age
+            fi
+            rm -f "$LOCK_DIR/pid" 2>/dev/null
+            rmdir "$LOCK_DIR" 2>/dev/null
+            if mkdir "$LOCK_DIR" 2>/dev/null; then
+                echo $$ >"$LOCK_DIR/pid" 2>/dev/null
+                return 0
+            fi
+            ;;
+    esac
+    return 1
+}
+
+release_lock_if_held() {
+    if [ "$TICK_LOCK_HELD" = 1 ]; then
+        rm -f "$LOCK_DIR/pid" 2>/dev/null
+        rmdir "$LOCK_DIR" 2>/dev/null
+        TICK_LOCK_HELD=0
+    fi
+}
+
+# dscacheutil_bounded HOST -- same query as `dscacheutil -q host -a name
+# HOST`, hard-capped at DSCACHEUTIL_TIMEOUT_SECONDS wall-clock seconds.
+# macOS has no timeout(1): this backgrounds the command directly (so $! is
+# its own pid, not a wrapping subshell's) and races it against a watchdog
+# that kills it after the bound -- the same background+watchdog pattern
+# already used below for the REGISTRY_DIFF generator subprocess. Kept
+# (rather than dropped in favor of `dig` alone) because dscacheutil, unlike
+# dig, honors /etc/resolver/<zone> -- with the corporate VPN down, a
+# corporate-zone host's configured resolver is unreachable and the system
+# resolver retries it for a long time; bounding it preserves that resolver
+# awareness (the caller still falls back to dig on top) without hanging.
+DSCACHEUTIL_TIMEOUT_SECONDS=3
+dscacheutil_bounded() {
+    host=$1
+    out=$(mktemp) || return 1
+    dscacheutil -q host -a name "$host" >"$out" 2>/dev/null &
+    cmd_pid=$!
+    ( sleep "$DSCACHEUTIL_TIMEOUT_SECONDS"; kill -TERM "$cmd_pid" 2>/dev/null ) &
+    watchdog_pid=$!
+    wait "$cmd_pid" 2>/dev/null
+    kill "$watchdog_pid" 2>/dev/null
+    wait "$watchdog_pid" 2>/dev/null
+    awk '/^ip_address:/{print $2; exit}' "$out"
+    rm -f "$out"
 }
 
 # --- Telegram: reuse the exact Keychain services and the plain (non-reply)
@@ -344,6 +465,46 @@ import_mismatch_diff() {
     rm -f "$nextstep" "$imp_json"
 }
 
+# registry_diff_is_due LAST_RUN_FILE SITES_FILE NOW FORCE -- prints
+# "DUE HAD_TIMESTAMP" for check REGISTRY_DIFF (5b, see below). Due only
+# with a valid persisted timestamp at least REGISTRY_DIFF_INTERVAL_SECONDS
+# old AND a SITES_FILE that exists and is at least
+# REGISTRY_DIFF_MIN_LIST_AGE_SECONDS old (a list generated today cannot
+# have drifted from the registry yet) -- unless FORCE=1, which is always
+# due (manual --force-registry-diff runs). HAD_TIMESTAMP=0 when
+# LAST_RUN_FILE is missing/unreadable/non-numeric; the caller must then
+# seed it and skip this tick, so a fresh install never runs this on its
+# very first tick.
+registry_diff_is_due() {
+    last_run_file=$1
+    sites_file=$2
+    now=$3
+    force=$4
+    had_timestamp=1
+    last_run=$(cat "$last_run_file" 2>/dev/null)
+    case "$last_run" in
+        ''|*[!0-9]*) had_timestamp=0; last_run=0 ;;
+    esac
+    sites_age=""
+    if [ -f "$sites_file" ]; then
+        sites_mtime=$(stat -f %m "$sites_file" 2>/dev/null)
+        case "$sites_mtime" in
+            ''|*[!0-9]*) ;;
+            *) sites_age=$((now - sites_mtime)) ;;
+        esac
+    fi
+    due=0
+    if [ "$force" = 1 ]; then
+        due=1
+    elif [ "$had_timestamp" = 1 ] \
+         && [ $((now - last_run)) -ge "$REGISTRY_DIFF_INTERVAL_SECONDS" ] \
+         && [ -n "$sites_age" ] \
+         && [ "$sites_age" -ge "$REGISTRY_DIFF_MIN_LIST_AGE_SECONDS" ]; then
+        due=1
+    fi
+    echo "$due $had_timestamp"
+}
+
 if [ "$SELF_TEST" = 1 ]; then
     echo "=== split-health.sh --self-test (offline: synthetic data only, no network/config/plist) ==="
     ST_OK=1
@@ -390,6 +551,80 @@ if [ "$SELF_TEST" = 1 ]; then
     st_check "(c) mismatching synthetic sets show +1 added / -1 removed" \
         "$([ "$1" = 1 ] && [ "$2" = 1 ] && echo 0 || echo 1)"
 
+    # --- (d) REGISTRY_DIFF due-date logic: first-run defer/seed, 7-day
+    # gate, and the "list must be >=1 day old" gate (see registry_diff_is_due) ---
+    RD_NOW=$NOW
+    rd_last_run_file="$ST_TMPDIR/registry-diff-last-run"
+    rd_sites_file="$ST_TMPDIR/sites-for-diff.txt"
+
+    # (d1) no timestamp file yet -> not due, HAD_TIMESTAMP=0.
+    set -- $(registry_diff_is_due "$rd_last_run_file" "$rd_sites_file" "$RD_NOW" 0)
+    st_check "(d1) first run (no persisted timestamp) reports not-due, no timestamp" \
+        "$([ "$1" = 0 ] && [ "$2" = 0 ] && echo 0 || echo 1)"
+
+    # Seed it (what a real first tick does), then confirm a second run
+    # within 7 days of that seeded timestamp is skipped.
+    printf '%s\n' "$RD_NOW" >"$rd_last_run_file"
+    touch "$rd_sites_file"
+    set -- $(registry_diff_is_due "$rd_last_run_file" "$rd_sites_file" "$RD_NOW" 0)
+    st_check "(d2) second run within 7 days of the seeded timestamp is skipped" \
+        "$([ "$1" = 0 ] && [ "$2" = 1 ] && echo 0 || echo 1)"
+
+    # (d3) an 8-day-old timestamp with a 2-day-old (>=1 day) list -> due.
+    rd_8d_ago=$((RD_NOW - 8 * 24 * 3600))
+    rd_2d_ago=$((RD_NOW - 2 * 24 * 3600))
+    printf '%s\n' "$rd_8d_ago" >"$rd_last_run_file"
+    touch -t "$(date -r "$rd_2d_ago" +%Y%m%d%H%M.%S)" "$rd_sites_file"
+    set -- $(registry_diff_is_due "$rd_last_run_file" "$rd_sites_file" "$RD_NOW" 0)
+    st_check "(d3) 8-day-old timestamp with a 2-day-old list is due" \
+        "$([ "$1" = 1 ] && echo 0 || echo 1)"
+
+    # (d4) same 8-day-old timestamp but a list generated today (<1 day
+    # old) -- must NOT be due: a fresh list cannot have drifted yet.
+    touch "$rd_sites_file"
+    set -- $(registry_diff_is_due "$rd_last_run_file" "$rd_sites_file" "$RD_NOW" 0)
+    st_check "(d4) 8-day-old timestamp with a same-day list is NOT due" \
+        "$([ "$1" = 0 ] && echo 0 || echo 1)"
+
+    # (d5) --force-registry-diff (FORCE=1) overrides both gates above.
+    set -- $(registry_diff_is_due "$rd_last_run_file" "$rd_sites_file" "$RD_NOW" 1)
+    st_check "(d5) FORCE=1 is due regardless of timestamp/list age" \
+        "$([ "$1" = 1 ] && echo 0 || echo 1)"
+
+    # --- (e) single-instance tick lock: acquire_lock leaves a live-owned
+    # lock alone, but breaks and re-acquires a lock whose owner is dead
+    # (same cases as bin/route-lift-watcher.sh's own self-test) ---
+    lock_dir_saved="$LOCK_DIR"
+
+    held_lock="$ST_TMPDIR/lock-alive"
+    mkdir "$held_lock"
+    echo $$ >"$held_lock/pid"
+    LOCK_DIR="$held_lock"
+    if acquire_lock; then
+        st_check "(e1) acquire_lock refuses a lock held by a live pid" 1
+        TICK_LOCK_HELD=1
+        release_lock_if_held
+    else
+        st_check "(e1) acquire_lock refuses a lock held by a live pid" 0
+    fi
+    rm -rf "$held_lock" 2>/dev/null
+
+    ( exit 0 ) &
+    dead_pid=$!
+    wait "$dead_pid" 2>/dev/null
+    dead_lock="$ST_TMPDIR/lock-dead"
+    mkdir "$dead_lock"
+    echo "$dead_pid" >"$dead_lock/pid"
+    LOCK_DIR="$dead_lock"
+    if acquire_lock && [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; then
+        st_check "(e2) acquire_lock breaks and re-acquires a lock whose owner pid is dead" 0
+    else
+        st_check "(e2) acquire_lock breaks and re-acquires a lock whose owner pid is dead" 1
+    fi
+    TICK_LOCK_HELD=1
+    release_lock_if_held
+    LOCK_DIR="$lock_dir_saved"
+
     rm -rf "$ST_TMPDIR"
     echo
     if [ "$ST_OK" = 1 ]; then
@@ -421,6 +656,60 @@ state_write() {   # state_write CHECKID STATUS EVIDENCE LAST_FAIL_NOTIFY
         printf 'LAST_TS=%s\n' "$NOW"
     } >"$tmp" 2>/dev/null && mv -f "$tmp" "$f"
 }
+
+# ID list for both --status and the notify/state-write loop near the end of
+# a real run/--dry-run; a plain string constant, so it costs nothing to
+# define this early for --status's sake.
+CHECK_IDS="CORP_LEAK SPLIT_ABSENT IPV6 STALE DNS_CLOBBER SYMPTOM_LIVE REGISTRY_DIFF IMPORT_MISMATCH"
+
+# --status is a PURE READ: only STATE_DIR (via state_read), LOG_FILE's last
+# 10 lines, the tick lock's presence/pid, and launchctl's own state are
+# read -- no DNS resolution, no route/ifconfig/plist inspection, no lock
+# acquisition, nothing that can block. Placed here, before MODE/utun
+# resolution and any of checks 1-5/5a/5b/5c below, so a --status invocation
+# never reaches any of that work.
+if [ "$STATUS" = 1 ]; then
+    echo "=== split-health status ==="
+    echo "Config: $CONFIG_DIR"
+    echo "State dir: $STATE_DIR"
+    echo
+    for id in $CHECK_IDS; do
+        st=$(state_read "$id" STATUS)
+        ev=$(state_read "$id" EVIDENCE)
+        ts=$(state_read "$id" LAST_TS)
+        if [ -z "$st" ]; then
+            printf '%-14s %s\n' "$id" "no state yet (never run without --dry-run/--status/--test-telegram)"
+        else
+            age="?"
+            [ -n "$ts" ] && age=$(( (NOW - ts) / 60 ))
+            printf '%-14s %-5s %s (обновлено %sм назад)\n' "$id" "$st" "$ev" "$age"
+        fi
+    done
+    echo
+    echo "Last 10 log lines ($LOG_FILE):"
+    if [ -r "$LOG_FILE" ]; then
+        tail -10 "$LOG_FILE"
+    else
+        echo "  (no log yet)"
+    fi
+    echo
+    if [ -d "$LOCK_DIR" ]; then
+        lock_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+        if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+            echo "Tick lock: HELD by pid $lock_pid (a tick is currently running)"
+        else
+            echo "Tick lock: present but owner pid ${lock_pid:-<unknown>} is not alive (stale; will be cleared on the next tick)"
+        fi
+    else
+        echo "Tick lock: not held"
+    fi
+    if launchctl print "gui/$(id -u)/$PLIST_LABEL" >/dev/null 2>&1; then
+        echo "LaunchAgent loaded: YES ($PLIST_LABEL)"
+    else
+        echo "LaunchAgent loaded: NO ($PLIST_LABEL)"
+    fi
+    exit 0
+fi
 
 # --- MODE (forward|exclude) from split-mode.txt; missing/unset defaults to
 # forward (Amnezia's historical default here) with a note, matching how the
@@ -464,6 +753,24 @@ case "$MODE" in
     exclude) SITES_FILE="$BUILD_DIR/amnezia-exclude.txt" ;;
 esac
 
+# =========================================================================
+# Single-instance tick lock -- the normal run only. --status/--test-telegram/
+# --self-test already returned above; --dry-run never takes this lock
+# either (it is a preview, meant to run alongside a real tick without
+# racing it). A concurrent second tick that finds the lock held logs one
+# line and exits 0 immediately instead of running any check or writing
+# state -- see acquire_lock/release_lock_if_held above for the lock itself.
+# =========================================================================
+if [ "$DRY_RUN" = 0 ]; then
+    if ! acquire_lock; then
+        mkdir -p "$STATE_DIR" "$(dirname "$LOG_FILE")" 2>/dev/null
+        printf '%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z') SKIP=lock-held MODE=${MODE}" >>"$LOG_FILE" 2>/dev/null
+        exit 0
+    fi
+    TICK_LOCK_HELD=1
+    trap 'release_lock_if_held' EXIT INT TERM
+fi
+
 # --- detect the two VPN utun interfaces (see lib-routes.sh) ---
 TUNNELS_FILE="$CONFIG_DIR/tunnels.txt"
 CORP_TUNNEL_PREFIX=$(get_tunnel_prefix CORP_TUNNEL_PREFIX)
@@ -488,7 +795,7 @@ CORP_LEAK_HIT=0
 CORP_LEAK_TABLE=""
 
 for host in $(read_lines "$CONFIG_DIR/corp-hosts-check.txt"); do
-    dscache_ip=$(dscacheutil -q host -a name "$host" 2>/dev/null | awk '/^ip_address:/{print $2; exit}')
+    dscache_ip=$(dscacheutil_bounded "$host")
     dig_ip=$(dig +short +time=2 +tries=1 A "$host" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
     test_ip=${dscache_ip:-$dig_ip}
     [ -z "$test_ip" ] && continue
@@ -615,10 +922,9 @@ fi
 
 # =========================================================================
 # Notification decision: shared by --dry-run (read-only preview) and the
-# real run (writes state + sends). ID list kept in one place for --status.
+# real run (writes state + sends). CHECK_IDS is defined earlier (next to
+# state_read/state_write) so --status can use it without reaching here.
 # =========================================================================
-CHECK_IDS="CORP_LEAK SPLIT_ABSENT IPV6 STALE DNS_CLOBBER SYMPTOM_LIVE REGISTRY_DIFF IMPORT_MISMATCH"
-
 check_label() {
     case "$1" in
         CORP_LEAK) echo "корпоративный хост через личный VPN" ;;
@@ -651,39 +957,6 @@ decide_send() {
     fi
     echo "$send $fail_notify"
 }
-
-if [ "$STATUS" = 1 ]; then
-    echo "=== split-health status ==="
-    echo "Config: $CONFIG_DIR"
-    echo "State dir: $STATE_DIR"
-    echo
-    for id in $CHECK_IDS; do
-        st=$(state_read "$id" STATUS)
-        ev=$(state_read "$id" EVIDENCE)
-        ts=$(state_read "$id" LAST_TS)
-        if [ -z "$st" ]; then
-            printf '%-14s %s\n' "$id" "no state yet (never run without --dry-run/--status/--test-telegram)"
-        else
-            age="?"
-            [ -n "$ts" ] && age=$(( (NOW - ts) / 60 ))
-            printf '%-14s %-5s %s (обновлено %sм назад)\n' "$id" "$st" "$ev" "$age"
-        fi
-    done
-    echo
-    echo "Last 10 log lines ($LOG_FILE):"
-    if [ -r "$LOG_FILE" ]; then
-        tail -10 "$LOG_FILE"
-    else
-        echo "  (no log yet)"
-    fi
-    echo
-    if launchctl print "gui/$(id -u)/$PLIST_LABEL" >/dev/null 2>&1; then
-        echo "LaunchAgent loaded: YES ($PLIST_LABEL)"
-    else
-        echo "LaunchAgent loaded: NO ($PLIST_LABEL)"
-    fi
-    exit 0
-fi
 
 # =========================================================================
 # Check SYMPTOM_LIVE (5a) -- WARN: a direct-domains.txt domain, or a public
@@ -790,23 +1063,29 @@ fi
 # Check REGISTRY_DIFF (5b) -- WARN: re-fetching RIPEstat/RIPE NCC data for
 # the current MODE and regenerating (dry-run, build/ untouched) produces a
 # different network list than what is currently generated. At most once
-# every 7 days (persisted in STATE_DIR); a timeout/failure reports INFO and
-# still counts as this cycle's attempt so a persistent outage does not
-# retry every single tick. Also deliberately skipped for --status (this can
-# take up to REGISTRY_DIFF_TIMEOUT_SECONDS on a real run).
+# every 7 days (persisted in STATE_DIR) AND only once SITES_FILE is at
+# least REGISTRY_DIFF_MIN_LIST_AGE_SECONDS old (see registry_diff_is_due
+# above) -- a fresh install has no persisted timestamp yet, so the very
+# first tick seeds one at NOW and skips instead of running the ~4-minute
+# refresh immediately (reported as INFO, not treated as a real check). A
+# timeout/failure once due reports INFO and still counts as this cycle's
+# attempt so a persistent outage does not retry every single tick.
+# --force-registry-diff (FORCE_REGISTRY_DIFF) makes this due unconditionally,
+# for a manual on-demand check. Also deliberately skipped for --status (this
+# can take up to REGISTRY_DIFF_TIMEOUT_SECONDS on a real run) -- --status
+# returns long before this point, see above.
 # =========================================================================
-REGISTRY_DIFF_LAST_RUN_FILE="$STATE_DIR/registry-diff-last-run"
-REGISTRY_DIFF_INTERVAL_SECONDS=$((7 * 24 * 3600))
-REGISTRY_DIFF_TIMEOUT_SECONDS=420
-REGISTRY_DIFF_LAST_RUN=0
-[ -f "$REGISTRY_DIFF_LAST_RUN_FILE" ] && REGISTRY_DIFF_LAST_RUN=$(cat "$REGISTRY_DIFF_LAST_RUN_FILE" 2>/dev/null)
+REGISTRY_DIFF_LAST_RUN=$(cat "$REGISTRY_DIFF_LAST_RUN_FILE" 2>/dev/null)
 case "$REGISTRY_DIFF_LAST_RUN" in ''|*[!0-9]*) REGISTRY_DIFF_LAST_RUN=0 ;; esac
-REGISTRY_DIFF_DUE=0
-[ $(( NOW - REGISTRY_DIFF_LAST_RUN )) -ge "$REGISTRY_DIFF_INTERVAL_SECONDS" ] && REGISTRY_DIFF_DUE=1
+set -- $(registry_diff_is_due "$REGISTRY_DIFF_LAST_RUN_FILE" "$SITES_FILE" "$NOW" "$FORCE_REGISTRY_DIFF")
+REGISTRY_DIFF_DUE=$1
+REGISTRY_DIFF_HAD_TIMESTAMP=$2
 REGISTRY_DIFF_DID_RUN=0
+REGISTRY_DIFF_PERSIST_NOW=0
 
 if [ "$REGISTRY_DIFF_DUE" = 1 ]; then
     REGISTRY_DIFF_DID_RUN=1
+    REGISTRY_DIFF_PERSIST_NOW=1
     RD_TMP_LIST=$(mktemp)
     RD_GEN_LOG=$(mktemp)
     RD_START=$(date +%s)
@@ -837,15 +1116,23 @@ if [ "$REGISTRY_DIFF_DUE" = 1 ]; then
         fi
     fi
     rm -f "$RD_TMP_LIST" "$RD_GEN_LOG"
+elif [ "$REGISTRY_DIFF_HAD_TIMESTAMP" = 0 ]; then
+    # Fresh install (or a wiped STATE_DIR): never run the ~4-minute refresh
+    # on the very first tick -- seed the timestamp at NOW instead (real run
+    # only, see the persist step below), so the first real attempt is 7
+    # days out like any other cycle.
+    REGISTRY_DIFF_PERSIST_NOW=1
+    REGISTRY_DIFF_STATUS=INFO
+    REGISTRY_DIFF_EVIDENCE="первая сверка с реестром отложена -- отметка времени только что установлена, следующая попытка через 7 дней"
 else
     REGISTRY_DIFF_STATUS=$(state_read REGISTRY_DIFF STATUS)
     REGISTRY_DIFF_EVIDENCE=$(state_read REGISTRY_DIFF EVIDENCE)
     [ -z "$REGISTRY_DIFF_STATUS" ] && REGISTRY_DIFF_STATUS=OK
     [ -z "$REGISTRY_DIFF_EVIDENCE" ] && REGISTRY_DIFF_EVIDENCE="сверка с реестром ещё не выполнялась"
-    if [ "$REGISTRY_DIFF_LAST_RUN" = 0 ]; then
-        REGISTRY_DIFF_EVIDENCE="$REGISTRY_DIFF_EVIDENCE (ни разу не выполнялась; раз в 7 дней)"
+    RD_AGE_DAYS=$(( (NOW - REGISTRY_DIFF_LAST_RUN) / 86400 ))
+    if [ $(( NOW - REGISTRY_DIFF_LAST_RUN )) -ge "$REGISTRY_DIFF_INTERVAL_SECONDS" ]; then
+        REGISTRY_DIFF_EVIDENCE="$REGISTRY_DIFF_EVIDENCE (срок настал ${RD_AGE_DAYS}д назад, но $SITES_FILE ещё не создан или моложе суток -- сверка отложена)"
     else
-        RD_AGE_DAYS=$(( (NOW - REGISTRY_DIFF_LAST_RUN) / 86400 ))
         REGISTRY_DIFF_EVIDENCE="$REGISTRY_DIFF_EVIDENCE (последняя проверка ${RD_AGE_DAYS}д назад; раз в 7 дней)"
     fi
 fi
@@ -994,10 +1281,11 @@ for id in $CHECK_IDS; do
     LOG_PARTS="${LOG_PARTS}${id}=${st} "
 done
 
-# REGISTRY_DIFF's 7-day gate is persisted only on a real run that actually
-# invoked the generator this tick (see the check's own comment above) --
-# never in --dry-run, so re-running --dry-run does not consume the budget.
-if [ "$REGISTRY_DIFF_DID_RUN" = 1 ]; then
+# REGISTRY_DIFF's 7-day gate is persisted only on a real run that either
+# actually invoked the generator this tick, or seeded the timestamp on a
+# fresh install (see the check's own comment above) -- never in --dry-run,
+# so re-running --dry-run does not consume the budget or seed anything.
+if [ "$REGISTRY_DIFF_PERSIST_NOW" = 1 ]; then
     mkdir -p "$STATE_DIR"
     printf '%s\n' "$NOW" >"$REGISTRY_DIFF_LAST_RUN_FILE" 2>/dev/null
 fi
