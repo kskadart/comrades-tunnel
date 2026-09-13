@@ -78,12 +78,6 @@ sites: ## Generate the AmneziaVPN site list into build/
 	@echo
 	@echo "Reminder: import $(BUILD_SUBDIR)/amnezia-sites.json in AmneziaVPN (Split tunneling -> \"⋮\" -> \"Replace site list\") and reconnect."
 
-.PHONY: sites-tunnel
-sites-tunnel: ## Generate the site list with the corporate VPN gateway routed through the personal VPN
-	@python3 "$(ROOT)/bin/gen-amnezia-sites.py" --config "$(CONFIG)" --gateway-mode tunnel $(MAX_SITES_FLAG)
-	@echo
-	@echo "Reminder: import $(BUILD_SUBDIR)/amnezia-sites.json in AmneziaVPN (Split tunneling -> \"⋮\" -> \"Replace site list\") and reconnect."
-
 .PHONY: sites-refresh
 sites-refresh: ## Same, forcing a re-download of the RIPE/RIPEstat cache
 	@python3 "$(ROOT)/bin/gen-amnezia-sites.py" --config "$(CONFIG)" --refresh $(MAX_SITES_FLAG)
@@ -110,10 +104,6 @@ sites-exclude: ## Generate the exclusion list for AmneziaVPN "all sites except t
 .PHONY: check
 check: ## Check the actual split routing (read-only)
 	@sh "$(ROOT)/bin/check-split.sh" --config "$(CONFIG)"
-
-.PHONY: check-tunnel
-check-tunnel: ## Check routing with the gateway expected inside the personal VPN
-	@sh "$(ROOT)/bin/check-split.sh" --config "$(CONFIG)" --gateway-mode tunnel
 
 .PHONY: check-exclude
 check-exclude: ## Check routing with AmneziaVPN in exclude mode

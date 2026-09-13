@@ -30,7 +30,7 @@
 # that the personal VPN's utun carries only a handful of routes (the four
 # fixed half-space routes), not one per excluded network.
 #
-# Usage: check-split.sh [--config DIR] [--gateway-mode {direct,tunnel}] [--mode {forward,exclude}]
+# Usage: check-split.sh [--config DIR] [--mode {forward,exclude}]
 # Exit code: 0 if every expectation PASSed, 1 otherwise.
 
 set -u
@@ -38,7 +38,6 @@ set -u
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 CONFIG_DIR="$REPO_ROOT/local"
-GATEWAY_MODE="direct"
 MODE="forward"
 
 while [ $# -gt 0 ]; do
@@ -51,14 +50,6 @@ while [ $# -gt 0 ]; do
             CONFIG_DIR=${1#--config=}
             shift
             ;;
-        --gateway-mode)
-            GATEWAY_MODE=$2
-            shift 2
-            ;;
-        --gateway-mode=*)
-            GATEWAY_MODE=${1#--gateway-mode=}
-            shift
-            ;;
         --mode)
             MODE=$2
             shift 2
@@ -68,19 +59,11 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         *)
-            echo "Usage: $0 [--config DIR] [--gateway-mode {direct,tunnel}] [--mode {forward,exclude}]" >&2
+            echo "Usage: $0 [--config DIR] [--mode {forward,exclude}]" >&2
             exit 2
             ;;
     esac
 done
-
-case "$GATEWAY_MODE" in
-    direct|tunnel) ;;
-    *)
-        echo "ERROR: invalid --gateway-mode '$GATEWAY_MODE' (expected 'direct' or 'tunnel')" >&2
-        exit 2
-        ;;
-esac
 
 case "$MODE" in
     forward|exclude) ;;
@@ -181,11 +164,11 @@ is_rfc1918() {
     esac
 }
 
-# Known corporate VPN gateway host-routes from vpn-gateways.txt. What they are
-# expected to route via follows --gateway-mode: 'direct' (default) expects them
-# on en0 (the physical interface), 'tunnel' expects them on the personal VPN's
-# utun instead.
-GATEWAY_IPS=$(read_lines "$CONFIG_DIR/vpn-gateways.txt" | sed 's#/[0-9]*$##')
+# Known corporate VPN gateway host-routes: the single-IP (/32, or bare IP
+# with no prefix) entries in direct-cidrs.txt. These are always expected to
+# route via en0 (the physical interface) -- the corporate VPN client reaches
+# its own gateway directly, never through the personal VPN.
+GATEWAY_IPS=$(read_lines "$CONFIG_DIR/direct-cidrs.txt" | awk -F/ 'NF==1 || $2=="32" {print $1}')
 
 is_gateway_ip() {
     ip=$1
@@ -193,15 +176,6 @@ is_gateway_ip() {
         [ "$g" = "$ip" ] && return 0
     done
     return 1
-}
-
-gateway_expected_iface() {
-    # What interface a gateway IP is expected to route via, by gateway-mode.
-    if [ "$GATEWAY_MODE" = "tunnel" ]; then
-        echo "${AMNEZIA_UTUN:-Amnezia_utun}"
-    else
-        echo "en0"
-    fi
 }
 
 echo "=== corp-hosts-check.txt ==="
@@ -226,8 +200,8 @@ for host in $HOSTS; do
 
     # Expected route interface for this host, generalized (no corporate
     # netblocks hardcoded here):
-    #   - resolved IP is a vpn-gateways.txt gateway -> gateway_expected_iface
-    #     (en0 in direct mode, personal utun in tunnel mode)
+    #   - resolved IP is a direct-cidrs.txt gateway  -> en0 (always; the
+    #     corporate VPN client reaches its own gateway directly)
     #   - otherwise the IP is RFC 1918               -> corporate VPN utun
     #   - otherwise (public corporate host)          -> in --mode forward it
     #     is merely NOT the personal utun (no site-list route claims it, so
@@ -236,7 +210,7 @@ for host in $HOSTS; do
     #     for it via the physical gateway (MacosRouteMonitor::
     #     addExclusionRoute) rather than just leaving it unclaimed.
     if is_gateway_ip "$test_ip"; then
-        expected=$(gateway_expected_iface)
+        expected="en0"
     elif is_rfc1918 "$test_ip"; then
         expected="${CP_UTUN:-CP_utun}"
     elif [ "$MODE" = "exclude" ]; then

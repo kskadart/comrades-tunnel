@@ -80,8 +80,7 @@ amnezia-vpn/amnezia-client, client/core/controllers/ipSplitTunnelingController.c
 
 Usage:
     gen-amnezia-sites.py [--config DIR] [--dry-run] [--dry-run-output PATH]
-                         [--mode {forward,exclude}]
-                         [--gateway-mode {direct,tunnel}] [--no-asn]
+                         [--mode {forward,exclude}] [--no-asn]
                          [--refresh] [--max-sites N] [--resolve-timeout N]
                          [--fallback-dns IP] [--self-test]
 
@@ -882,16 +881,6 @@ def main() -> int:
              "Each mode only touches its own output files.",
     )
     parser.add_argument(
-        "--gateway-mode",
-        choices=("direct", "tunnel"),
-        default="direct",
-        help="how to treat vpn-gateways.txt entries (the corporate VPN client's "
-             "own gateway IPs): 'direct' (default) excludes them from the site "
-             "list so the corporate client reaches them via the physical "
-             "interface; 'tunnel' keeps them in the site list so the personal "
-             "VPN carries them",
-    )
-    parser.add_argument(
         "--no-asn",
         action="store_true",
         help="disable whole-ASN expansion of direct domains (old /32-only behaviour)",
@@ -1001,26 +990,6 @@ def main() -> int:
         exclusions.add(net)
         parsed_direct_cidrs.append(net)
         n_direct_cidrs += 1
-
-    # --- vpn-gateways.txt: the corporate VPN client's own gateway IPs -------
-    # These are a separate concept from direct-cidrs.txt (which is always
-    # excluded, unconditionally). Whether the gateways are excluded depends on
-    # --gateway-mode: 'direct' (default) excludes them so the corporate client
-    # reaches them via the physical interface; 'tunnel' keeps them inside the
-    # site list so the personal VPN carries them.
-    gateway_cidrs_raw = read_list(config_dir / "vpn-gateways.txt")
-    n_gateway_cidrs = 0
-    parsed_gateway_cidrs = []  # valid CIDR networks parsed from vpn-gateways.txt
-    for cidr in gateway_cidrs_raw:
-        try:
-            net = ipaddress.ip_network(cidr, strict=False)
-        except ValueError as exc:
-            print(f"WARNING: skipping invalid CIDR '{cidr}' in vpn-gateways.txt: {exc}")
-            continue
-        if args.gateway_mode == "direct":
-            exclusions.add(net)
-        parsed_gateway_cidrs.append(net)
-        n_gateway_cidrs += 1
 
     # --- keep-tunneled.txt: networks pinned to stay inside the personal VPN -
     # These are never added to `exclusions` -- they are ordinary addresses
@@ -1296,11 +1265,6 @@ def main() -> int:
     print("=== Exclusion summary ===")
     print(f"  special/reserved ranges     : {len(SPECIAL_RANGES)}")
     print(f"  direct-cidrs.txt entries    : {n_direct_cidrs}")
-    gw_state = {  # how each gateway-mode treats vpn-gateways.txt
-        "direct": "excluded from the site list",
-        "tunnel": "NOT excluded (in the site list)",
-    }[args.gateway_mode]
-    print(f"  vpn-gateways.txt entries    : {n_gateway_cidrs} (gateway-mode {args.gateway_mode}: {gw_state})")
     n_total_resolved = sum(len(r["ips"]) for r in domain_records)
     print(f"  direct-domains.txt          : {len(domain_records)} domain(s) -> {n_total_resolved} resolved IPv4")
     for r in domain_records:
@@ -1467,34 +1431,6 @@ def main() -> int:
         first = net.network_address
         check(f"direct-cidrs.txt first address {first} goes direct (not tunneled)",
               goes_direct(str(first)))
-
-    # vpn-gateways.txt entries follow the active gateway-mode:
-    #   direct: every gateway must go direct (excluded, like today);
-    #   tunnel: every gateway MUST stay in the personal VPN.
-    #   Exception in tunnel mode: a gateway that lies inside an always-direct
-    #   direct-cidrs.txt entry is shadowed by it -- the always-direct block
-    #   supersedes gateway-mode by design, so it cannot route through the
-    #   tunnel. That is the direct-cidrs path, not the vpn-gateways path, so
-    #   it is reported explicitly (not as a coverage FAIL and not silently).
-    for net in parsed_gateway_cidrs:
-        first = net.network_address
-        if args.gateway_mode == "tunnel":
-            if not goes_direct(str(first)):
-                check(f"vpn-gateways.txt first address {first} stays in the personal VPN", True)
-            else:
-                shadowing = [
-                    d for d in parsed_direct_cidrs
-                    if ipaddress.ip_address(first) in d
-                ]
-                if shadowing:
-                    print(f"  [info] vpn-gateways.txt first address {first} is inside always-direct "
-                          f"direct-cidrs.txt entry {shadowing[0]} -- gateway-mode cannot override an "
-                          f"always-direct block, so it stays direct by design")
-                else:
-                    check(f"vpn-gateways.txt first address {first} stays in the personal VPN", False)
-        else:
-            check(f"vpn-gateways.txt first address {first} goes direct (not tunneled)",
-                  goes_direct(str(first)))
 
     # Every resolved direct-domains.txt IP must go direct. Unresolvable
     # placeholder domains (e.g. in config/example) only produce WARNINGs above,

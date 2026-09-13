@@ -2,4 +2,11 @@
 # gateway IPs and corporate public netblocks (so the corporate VPN client
 # itself, and anything already routed by it, keeps working).
 # One CIDR (or /32 host) per line.
+
+# The corporate VPN client's own gateway endpoint(s) -- the specific IP(s)
+# it handshakes with to build its tunnel (always excluded, so the client
+# reaches them via the physical interface):
+# 203.0.113.10/32
+
+# Corporate public netblocks reached over the corporate tunnel:
 203.0.113.0/24
