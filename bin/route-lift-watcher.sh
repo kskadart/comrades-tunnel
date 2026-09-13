@@ -1331,6 +1331,10 @@ fi
 # installed conf file by default, or --config DIR to read a repo config dir
 # directly without installing anything) ---
 if [ -n "$CONFIG_DIR" ]; then
+    # A relative --config is resolved against the CWD first (unchanged
+    # behaviour), falling back to REPO_ROOT so it also works from any other
+    # directory -- see resolve_config_dir in lib-routes.sh.
+    CONFIG_DIR=$(resolve_config_dir "$REPO_ROOT" "$CONFIG_DIR")
     TUNNELS_FILE="$CONFIG_DIR/tunnels.txt"
     if [ ! -f "$TUNNELS_FILE" ]; then
         echo "ERROR: $TUNNELS_FILE not found (see config/example/tunnels.txt)" >&2

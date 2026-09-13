@@ -141,7 +141,7 @@ health-status: ## Show the monitor's last reported state per check and recent lo
 
 .PHONY: health-run-once
 health-run-once: ## Run one split-health tick in the foreground (no daemon), for testing
-	@sh "$(ROOT)/bin/split-health.sh" --config "$(CONFIG)"
+	@sh "$(ROOT)/bin/split-health.sh" --config "$(CONFIG)" --verbose
 
 .PHONY: health-install
 health-install: ## Install and load the split-health LaunchAgent (no sudo)

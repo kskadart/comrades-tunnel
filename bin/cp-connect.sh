@@ -182,6 +182,11 @@ esac
 # lib-routes.sh's header comment for the exact contract.
 . "$SCRIPT_DIR/lib-routes.sh"
 
+# A relative --config is resolved against the CWD first (unchanged
+# behaviour), falling back to REPO_ROOT so it also works from any other
+# directory -- see resolve_config_dir in lib-routes.sh.
+CONFIG_DIR=$(resolve_config_dir "$REPO_ROOT" "$CONFIG_DIR")
+
 # routes_restore_should_run -- true (0) when a live (non-dry-run) restore
 # for --method routes should actually touch SAVED_ROUTES_FILE this run:
 # only once THIS run's own save_amnezia_routes has actually run

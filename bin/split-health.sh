@@ -23,10 +23,9 @@
 #
 # Checks performed every run (OK/WARN/FAIL each), full rationale for the
 # thresholds in the corresponding code below:
-#   1. FAIL -- a host in corp-hosts-check.txt, or (in --gateway-mode direct)
-#      a vpn-gateways.txt entry or the first address of a direct-cidrs.txt
-#      CIDR, resolves/routes via the PERSONAL VPN's utun. Wrong in every
-#      mode -- this is the dangerous case.
+#   1. FAIL -- a host in corp-hosts-check.txt, or an entry in
+#      direct-cidrs.txt, resolves/routes via the PERSONAL VPN's utun. Wrong
+#      in every mode -- this is the dangerous case.
 #   2. FAIL -- the personal utun is up but carries a route count that does
 #      not match local/split-mode.txt's MODE: more than 50 in `exclude`
 #      (should be ~4 fixed half-space routes) or fewer than 50 while
@@ -91,11 +90,16 @@
 # and WARN<->FAIL for completeness), read from per-check state files under
 # STATE_DIR; while a check stays FAIL, a reminder resends at most once every
 # 6 hours. Every real run appends one compact line to LOG_FILE regardless of
-# whether anything was sent. Telegram credentials are read from the same two
-# Keychain items ~/.claude/hooks/telegram-notify.sh uses (tg_creds/
-# tg_send_raw in that script): "comrades-tunnel-telegram-bot-token"
-# and "comrades-tunnel-telegram-bot-chat", both `-a "$USER"`. They are
-# never printed or logged.
+# whether anything was sent. The Keychain item NAMES for the bot token/chat
+# id are read from CONFIG_DIR/telegram.txt (KEYCHAIN_TOKEN_ITEM=/
+# KEYCHAIN_CHAT_ITEM=, parsed with grep/cut like every other config file in
+# this repo -- never sourced), falling back to the same two hardcoded names
+# ~/.claude/hooks/telegram-notify.sh uses (tg_creds/tg_send_raw in that
+# script) when the file or a key is missing, so an existing install with no
+# telegram.txt keeps working unchanged: "comrades-tunnel-telegram-
+# bot-token" and "comrades-tunnel-telegram-bot-chat", both
+# `-a "$USER"`. Neither the item names nor the secrets they name are ever
+# printed or logged.
 #
 # Build output is namespaced per --config (see gen-amnezia-sites.py): the
 # default local/ writes to build/, anything else writes to
@@ -103,10 +107,9 @@
 # SITES_FILE (used by checks 5a/5b/5d) always points at the file the active
 # --config actually produced.
 #
-# Usage: split-health.sh [--config DIR] [--gateway-mode {direct,tunnel}]
-#                         [--stale-days N] [--dry-run] [--status]
-#                         [--test-telegram] [--self-test]
-#                         [--force-registry-diff]
+# Usage: split-health.sh [--config DIR] [--stale-days N] [--dry-run]
+#                         [--status] [--test-telegram] [--self-test]
+#                         [--force-registry-diff] [--verbose]
 # With no mode flag, this performs a real run: checks, updates state,
 # sends Telegram per the policy above, and appends one log line. Exit code
 # is always 0 in that mode (a LaunchAgent tick must never look like a
@@ -115,6 +118,10 @@
 # network, no real config/plist) and exits 0 only if every case PASSes.
 # --force-registry-diff makes 5b (REGISTRY_DIFF) due unconditionally, for a
 # manual on-demand check, and works with --dry-run or a real run alike.
+# --verbose makes a real run also print the same one-line summary that
+# always goes to LOG_FILE, so a manual foreground tick (`make
+# health-run-once`) is not silent; the installed LaunchAgent never passes
+# this flag, so its stdout (captured to LAUNCHD_LOG) is unaffected.
 #
 # --status is a pure read: it only reads STATE_DIR and the last 10 lines of
 # LOG_FILE and prints them (plus whether a tick currently holds the lock
@@ -135,20 +142,18 @@ REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 . "$SCRIPT_DIR/lib-routes.sh"
 
 CONFIG_DIR="$REPO_ROOT/local"
-GATEWAY_MODE="direct"
 STALE_DAYS=30
 DRY_RUN=0
 STATUS=0
 TEST_TELEGRAM=0
 SELF_TEST=0
 FORCE_REGISTRY_DIFF=0
+VERBOSE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --config) CONFIG_DIR=$2; shift 2 ;;
         --config=*) CONFIG_DIR=${1#--config=}; shift ;;
-        --gateway-mode) GATEWAY_MODE=$2; shift 2 ;;
-        --gateway-mode=*) GATEWAY_MODE=${1#--gateway-mode=}; shift ;;
         --stale-days) STALE_DAYS=$2; shift 2 ;;
         --stale-days=*) STALE_DAYS=${1#--stale-days=}; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
@@ -156,20 +161,19 @@ while [ $# -gt 0 ]; do
         --test-telegram) TEST_TELEGRAM=1; shift ;;
         --self-test) SELF_TEST=1; shift ;;
         --force-registry-diff) FORCE_REGISTRY_DIFF=1; shift ;;
+        --verbose) VERBOSE=1; shift ;;
         *)
-            echo "Usage: $0 [--config DIR] [--gateway-mode {direct,tunnel}] [--stale-days N] [--dry-run] [--status] [--test-telegram] [--self-test] [--force-registry-diff]" >&2
+            echo "Usage: $0 [--config DIR] [--stale-days N] [--dry-run] [--status] [--test-telegram] [--self-test] [--force-registry-diff] [--verbose]" >&2
             exit 2
             ;;
     esac
 done
 
-case "$GATEWAY_MODE" in
-    direct|tunnel) ;;
-    *)
-        echo "ERROR: invalid --gateway-mode '$GATEWAY_MODE' (expected 'direct' or 'tunnel')" >&2
-        exit 2
-        ;;
-esac
+# A relative --config is resolved against the CWD first (unchanged
+# behaviour), falling back to REPO_ROOT so it also works from any other
+# directory -- see resolve_config_dir in lib-routes.sh (already sourced
+# above).
+CONFIG_DIR=$(resolve_config_dir "$REPO_ROOT" "$CONFIG_DIR")
 
 STATE_DIR="$HOME/Library/Application Support/comrades-tunnel/split-health-state"
 LOCK_DIR="$STATE_DIR/lock"
@@ -211,6 +215,23 @@ NL='
 
 route_iface() {
     route -n get "$1" 2>/dev/null | awk '/interface:/{print $2}'
+}
+
+# resolve_keychain_item DIR KEY DEFAULT -- print the value of "KEY=" in
+# DIR/telegram.txt (grep/cut only, never sourced/eval'd -- same discipline
+# as every other config file in this repo), or DEFAULT when the file or
+# that key is missing, so an existing install with no telegram.txt (or an
+# incomplete one) keeps using the historical hardcoded Keychain item names.
+resolve_keychain_item() {
+    dir=$1
+    key=$2
+    default=$3
+    value=$(grep "^${key}=" "$dir/telegram.txt" 2>/dev/null | tail -1 | cut -d= -f2-)
+    if [ -n "$value" ]; then
+        printf '%s\n' "$value"
+    else
+        printf '%s\n' "$default"
+    fi
 }
 
 # age_seconds PATH -- seconds since PATH's mtime, or empty if PATH does not
@@ -296,12 +317,16 @@ dscacheutil_bounded() {
     rm -f "$out"
 }
 
-# --- Telegram: reuse the exact Keychain services and the plain (non-reply)
-# curl POST shape from ~/.claude/hooks/telegram-notify.sh's tg_creds/
-# tg_send_raw. Never echoes TG_TOKEN/TG_CHAT_ID.
+# --- Telegram: reuse the exact Keychain service-lookup and the plain
+# (non-reply) curl POST shape from ~/.claude/hooks/telegram-notify.sh's
+# tg_creds/tg_send_raw. Item NAMES come from CONFIG_DIR/telegram.txt, with
+# a fallback to that script's own hardcoded names (see resolve_keychain_item
+# and the header comment above). Never echoes TG_TOKEN/TG_CHAT_ID.
+KEYCHAIN_TOKEN_ITEM=$(resolve_keychain_item "$CONFIG_DIR" KEYCHAIN_TOKEN_ITEM "comrades-tunnel-telegram-bot-token")
+KEYCHAIN_CHAT_ITEM=$(resolve_keychain_item "$CONFIG_DIR" KEYCHAIN_CHAT_ITEM "comrades-tunnel-telegram-bot-chat")
 tg_creds() {
-    TG_TOKEN=$(security find-generic-password -a "$USER" -s comrades-tunnel-telegram-bot-token -w 2>/dev/null)
-    TG_CHAT_ID=$(security find-generic-password -a "$USER" -s comrades-tunnel-telegram-bot-chat -w 2>/dev/null)
+    TG_TOKEN=$(security find-generic-password -a "$USER" -s "$KEYCHAIN_TOKEN_ITEM" -w 2>/dev/null)
+    TG_CHAT_ID=$(security find-generic-password -a "$USER" -s "$KEYCHAIN_CHAT_ITEM" -w 2>/dev/null)
     [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT_ID" ]
 }
 
@@ -325,7 +350,7 @@ tg_send() {   # $1 = plain text. Prints one status line; returns 0 if HTTP 200.
 
 if [ "$TEST_TELEGRAM" = 1 ]; then
     if ! tg_creds; then
-        echo "Telegram credentials did not resolve from Keychain for user $USER (comrades-tunnel-telegram-bot-token / -chat) -- skipping test send."
+        echo "Telegram credentials did not resolve from Keychain for user $USER ($KEYCHAIN_TOKEN_ITEM / $KEYCHAIN_CHAT_ITEM) -- skipping test send."
         exit 0
     fi
     echo "Sending exactly one test message..."
@@ -625,6 +650,19 @@ if [ "$SELF_TEST" = 1 ]; then
     release_lock_if_held
     LOCK_DIR="$lock_dir_saved"
 
+    # --- (f) resolve_keychain_item: telegram.txt present overrides the
+    # default Keychain item name; a missing file (or missing key) falls
+    # back to the default, so an existing install with no telegram.txt
+    # keeps working unchanged ---
+    printf 'KEYCHAIN_TOKEN_ITEM=custom-token-item\nKEYCHAIN_CHAT_ITEM=custom-chat-item\n' >"$ST_TMPDIR/telegram.txt"
+    st_check "(f1) telegram.txt present: KEYCHAIN_TOKEN_ITEM overrides the default" \
+        "$([ "$(resolve_keychain_item "$ST_TMPDIR" KEYCHAIN_TOKEN_ITEM default-token)" = "custom-token-item" ] && echo 0 || echo 1)"
+    st_check "(f2) telegram.txt present: KEYCHAIN_CHAT_ITEM overrides the default" \
+        "$([ "$(resolve_keychain_item "$ST_TMPDIR" KEYCHAIN_CHAT_ITEM default-chat)" = "custom-chat-item" ] && echo 0 || echo 1)"
+    rm -f "$ST_TMPDIR/telegram.txt"
+    st_check "(f3) telegram.txt missing: KEYCHAIN_TOKEN_ITEM falls back to the default" \
+        "$([ "$(resolve_keychain_item "$ST_TMPDIR" KEYCHAIN_TOKEN_ITEM default-token)" = "default-token" ] && echo 0 || echo 1)"
+
     rm -rf "$ST_TMPDIR"
     echo
     if [ "$ST_OK" = 1 ]; then
@@ -732,15 +770,10 @@ esac
 
 # --- build output is namespaced per --config (see gen-amnezia-sites.py's
 # module docstring): the default local/ writes to build/, anything else
-# writes to build/<config-dir-basename>/. Resolve CONFIG_DIR to an absolute
-# path first (same "relative is relative to REPO_ROOT" convention
-# install-split-health.sh already uses) so the comparison against
+# writes to build/<config-dir-basename>/. CONFIG_DIR was already resolved
+# to an absolute path above (resolve_config_dir), so the comparison against
 # REPO_ROOT/local is exact regardless of how --config was spelled. ---
-case "$CONFIG_DIR" in
-    /*) CONFIG_DIR_ABS=$CONFIG_DIR ;;
-    *) CONFIG_DIR_ABS="$REPO_ROOT/$CONFIG_DIR" ;;
-esac
-[ -d "$CONFIG_DIR_ABS" ] && CONFIG_DIR_ABS=$(cd "$CONFIG_DIR_ABS" && pwd)
+CONFIG_DIR_ABS=$CONFIG_DIR
 
 if [ "$CONFIG_DIR_ABS" = "$REPO_ROOT/local" ]; then
     BUILD_DIR="$REPO_ROOT/build"
@@ -786,11 +819,7 @@ AMNEZIA_ROUTES=0
 # Check 1 -- FAIL: corporate host/gateway/netblock routed via personal VPN
 # =========================================================================
 CORP_LEAK_STATUS=OK
-if [ "$GATEWAY_MODE" = "direct" ]; then
-    CORP_LEAK_EVIDENCE="ни один хост из corp-hosts-check.txt, ни шлюз/сеть из vpn-gateways.txt/direct-cidrs.txt не идёт через личный VPN"
-else
-    CORP_LEAK_EVIDENCE="ни один хост из corp-hosts-check.txt не идёт через личный VPN (gateway-mode=tunnel: шлюзы не проверяются)"
-fi
+CORP_LEAK_EVIDENCE="ни один хост из corp-hosts-check.txt, ни сеть/шлюз из direct-cidrs.txt не идёт через личный VPN"
 CORP_LEAK_HIT=0
 CORP_LEAK_TABLE=""
 
@@ -808,8 +837,8 @@ for host in $(read_lines "$CONFIG_DIR/corp-hosts-check.txt"); do
     fi
 done
 
-if [ "$GATEWAY_MODE" = "direct" ] && [ "$CORP_LEAK_HIT" = 0 ]; then
-    for src in "$CONFIG_DIR/direct-cidrs.txt" "$CONFIG_DIR/vpn-gateways.txt"; do
+if [ "$CORP_LEAK_HIT" = 0 ]; then
+    for src in "$CONFIG_DIR/direct-cidrs.txt"; do
         [ -f "$src" ] || continue
         for entry in $(read_lines "$src"); do
             ip=${entry%%/*}
@@ -1164,7 +1193,7 @@ fi
 
 print_table() {   # shared by --dry-run and the real run's own echo to stdout
     echo "Config dir: $CONFIG_DIR"
-    echo "Gateway mode: $GATEWAY_MODE   Split mode (from $MODE_FILE): $MODE   Stale threshold: ${STALE_DAYS}d"
+    echo "Split mode (from $MODE_FILE): $MODE   Stale threshold: ${STALE_DAYS}d"
     [ -n "$MODE_NOTE" ] && echo "$MODE_NOTE"
     echo
     echo "=== INFO ==="
@@ -1179,7 +1208,7 @@ print_table() {   # shared by --dry-run and the real run's own echo to stdout
         echo "  Personal utun:  not present"
     fi
     echo
-    echo "=== check 1: corp-hosts-check.txt / vpn-gateways.txt / direct-cidrs.txt routing ==="
+    echo "=== check 1: corp-hosts-check.txt / direct-cidrs.txt routing ==="
     printf '  %-42s %-16s %s\n' "TARGET" "IP" "IFACE"
     if [ -n "$CORP_LEAK_TABLE" ]; then
         printf '%b' "$CORP_LEAK_TABLE"
@@ -1293,5 +1322,11 @@ fi
 LOG_LINE="$(date '+%Y-%m-%dT%H:%M:%S%z') ${LOG_PARTS}MODE=${MODE} CP_UTUN=${CP_UTUN:-none}(${CP_ROUTES}) AMNEZIA_UTUN=${AMNEZIA_UTUN:-none}(${AMNEZIA_ROUTES})"
 mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
 printf '%s\n' "$LOG_LINE" >>"$LOG_FILE" 2>/dev/null
+
+# --verbose (passed by `make health-run-once`) prints the same one-line
+# summary to stdout so a manual foreground tick is not silent; the
+# installed LaunchAgent never passes this flag, so its stdout (captured to
+# LAUNCHD_LOG) is unaffected.
+[ "$VERBOSE" = 1 ] && printf '%s\n' "$LOG_LINE"
 
 exit 0

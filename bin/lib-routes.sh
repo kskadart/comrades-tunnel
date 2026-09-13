@@ -48,6 +48,34 @@ else
     SUDO="sudo"
 fi
 
+# resolve_config_dir REPO_ROOT DIR -- resolve a possibly-relative --config
+# DIR to an absolute path: an absolute DIR is returned unchanged; a
+# relative DIR is resolved against the current working directory when it
+# exists there (unchanged behaviour), else against REPO_ROOT (the script's
+# parent directory) instead, so `--config local` works from any CWD, not
+# just the repo root. A DIR that exists in neither location is returned as
+# a CWD-relative absolute path (still unresolved further) so the caller's
+# own "not found" error still names the path as given. Duplicated in
+# check-split.sh/dns-guard.sh/install-dns-guard.sh/install-split-health.sh,
+# which do not source this file -- same small-helper convention as
+# read_lines elsewhere in this repo.
+resolve_config_dir() {
+    repo_root=$1
+    dir=$2
+    case "$dir" in
+        /*) printf '%s\n' "$dir"; return 0 ;;
+    esac
+    if [ -d "$dir" ]; then
+        (cd "$dir" && pwd)
+        return 0
+    fi
+    if [ -d "$repo_root/$dir" ]; then
+        (cd "$repo_root/$dir" && pwd)
+        return 0
+    fi
+    printf '%s/%s\n' "$(pwd)" "$dir"
+}
+
 # detect_utun_by_prefix PREFIX -- print the first utunN whose inet address
 # starts with PREFIX, never hardcoding a specific utun number.
 detect_utun_by_prefix() {

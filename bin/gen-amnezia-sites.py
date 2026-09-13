@@ -844,6 +844,27 @@ def covered_by(ip_str: str, networks) -> bool:
     return any(ip in net for net in networks)
 
 
+def resolve_config_dir(repo_root: Path, raw: str) -> Path:
+    """Resolve a possibly-relative --config DIR to an absolute path: an
+    absolute DIR is returned unchanged; a relative DIR is resolved against
+    the current working directory when it exists there (unchanged
+    behaviour), else against repo_root instead, so `--config local` works
+    from any CWD, not just the repo root. A DIR that exists in neither
+    location is returned as a CWD-relative absolute path (still unresolved
+    further) so the caller's own "not found" error still names the path as
+    given."""
+    p = Path(raw)
+    if p.is_absolute():
+        return p
+    cwd_candidate = Path.cwd() / p
+    if cwd_candidate.is_dir():
+        return cwd_candidate.resolve()
+    repo_candidate = repo_root / p
+    if repo_candidate.is_dir():
+        return repo_candidate.resolve()
+    return cwd_candidate
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
@@ -944,7 +965,7 @@ def main() -> int:
     if args.self_test:
         return self_test(args.fallback_dns)
 
-    config_dir = Path(args.config).resolve() if args.config else (REPO_ROOT / "local")
+    config_dir = resolve_config_dir(REPO_ROOT, args.config) if args.config else (REPO_ROOT / "local")
     if not config_dir.is_dir():
         print(f"ERROR: config dir not found: {config_dir}", file=sys.stderr)
         return 1

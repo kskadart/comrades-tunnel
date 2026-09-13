@@ -230,6 +230,13 @@ if [ ! -f "$KEEPROUTES_SRC" ]; then
     exit 1
 fi
 
+# Reuse resolve_config_dir/get_tunnel_prefix from lib-routes.sh instead of
+# re-implementing the same grep/cut parsing here. A relative --config is
+# resolved against the CWD first (unchanged behaviour), falling back to
+# REPO_ROOT so it also works from any other directory.
+. "$LIBROUTES_SRC"
+CONFIG_DIR=$(resolve_config_dir "$REPO_ROOT" "$CONFIG_DIR")
+
 TUNNELS_FILE="$CONFIG_DIR/tunnels.txt"
 if [ ! -f "$TUNNELS_FILE" ]; then
     echo "ERROR: $TUNNELS_FILE not found (see config/example/tunnels.txt)" >&2
@@ -237,9 +244,6 @@ if [ ! -f "$TUNNELS_FILE" ]; then
 fi
 KEEPFILE_SRC="$CONFIG_DIR/keep-routes-for.txt"
 
-# Reuse get_tunnel_prefix from lib-routes.sh instead of re-implementing the
-# same grep/cut parsing here.
-. "$LIBROUTES_SRC"
 PERSONAL_TUNNEL_PREFIX=$(get_tunnel_prefix PERSONAL_TUNNEL_PREFIX)
 if [ -z "$PERSONAL_TUNNEL_PREFIX" ]; then
     echo "ERROR: PERSONAL_TUNNEL_PREFIX not set in $TUNNELS_FILE" >&2

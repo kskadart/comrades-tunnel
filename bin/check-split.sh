@@ -28,7 +28,14 @@
 # installs a real kernel route for each excluded network via the physical
 # gateway (see MacosRouteMonitor::addExclusionRoute) -- and it also checks
 # that the personal VPN's utun carries only a handful of routes (the four
-# fixed half-space routes), not one per excluded network.
+# fixed half-space routes), not one per excluded network. Exception: a
+# corp-hosts-check.txt entry that resolves to a public (non-RFC1918)
+# address is checked the same way in both modes -- merely NOT the personal
+# VPN's utun -- because with the corporate VPN connected, Check Point can
+# push a more-specific route for that same public host via its own utun,
+# which then wins over AmneziaVPN's en0 exclusion route by longest-prefix-
+# match; traffic to a corporate host inside the corporate tunnel is correct
+# and safe, so either interface passes.
 #
 # Usage: check-split.sh [--config DIR] [--mode {forward,exclude}]
 # Exit code: 0 if every expectation PASSed, 1 otherwise.
@@ -72,6 +79,32 @@ case "$MODE" in
         exit 2
         ;;
 esac
+
+# resolve_config_dir REPO_ROOT DIR -- resolve a possibly-relative --config
+# DIR to an absolute path: an absolute DIR is returned unchanged; a
+# relative DIR is resolved against the current working directory when it
+# exists there (unchanged behaviour), else against REPO_ROOT (the script's
+# parent directory) instead, so `--config local` works from any CWD, not
+# just the repo root. A DIR that exists in neither location is returned as
+# a CWD-relative absolute path (still unresolved further) so the caller's
+# own "not found" error still names the path as given.
+resolve_config_dir() {
+    repo_root=$1
+    dir=$2
+    case "$dir" in
+        /*) printf '%s\n' "$dir"; return 0 ;;
+    esac
+    if [ -d "$dir" ]; then
+        (cd "$dir" && pwd)
+        return 0
+    fi
+    if [ -d "$repo_root/$dir" ]; then
+        (cd "$repo_root/$dir" && pwd)
+        return 0
+    fi
+    printf '%s/%s\n' "$(pwd)" "$dir"
+}
+CONFIG_DIR=$(resolve_config_dir "$REPO_ROOT" "$CONFIG_DIR")
 
 read_lines() {
     [ -f "$1" ] || return 0
@@ -203,18 +236,19 @@ for host in $HOSTS; do
     #   - resolved IP is a direct-cidrs.txt gateway  -> en0 (always; the
     #     corporate VPN client reaches its own gateway directly)
     #   - otherwise the IP is RFC 1918               -> corporate VPN utun
-    #   - otherwise (public corporate host)          -> in --mode forward it
-    #     is merely NOT the personal utun (no site-list route claims it, so
-    #     it falls through to whatever else does); in --mode exclude it is
-    #     specifically en0, because AmneziaVPN installs a real kernel route
-    #     for it via the physical gateway (MacosRouteMonitor::
-    #     addExclusionRoute) rather than just leaving it unclaimed.
+    #   - otherwise (public corporate host)          -> merely NOT the
+    #     personal utun, in both modes. In --mode forward no site-list
+    #     route claims it, so it falls through to whatever else does; in
+    #     --mode exclude AmneziaVPN installs a real kernel route for it via
+    #     the physical gateway (MacosRouteMonitor::addExclusionRoute), but
+    #     with the corporate VPN connected, Check Point can push a
+    #     more-specific route for that same public host via its own utun,
+    #     which wins over that en0 route by longest-prefix-match -- either
+    #     interface is safe here, only the personal VPN would not be.
     if is_gateway_ip "$test_ip"; then
         expected="en0"
     elif is_rfc1918 "$test_ip"; then
         expected="${CP_UTUN:-CP_utun}"
-    elif [ "$MODE" = "exclude" ]; then
-        expected="en0"
     else
         expected="!${AMNEZIA_UTUN:-Amnezia_utun}"
     fi
