@@ -1,0 +1,15 @@
+# Keychain item names bin/split-health.sh reads Telegram credentials from
+# (bot token and chat id), so they are not tied to any one person's login.
+#
+# NOTE: bin/split-health.sh does not read this file yet -- it still looks
+# up its own hardcoded Keychain item names. See the README ("Мониторинг
+# разбиения: bin/split-health.sh") for the two-line change still needed to
+# make it read KEYCHAIN_TOKEN_ITEM/KEYCHAIN_CHAT_ITEM from here (with a
+# fallback to its current defaults), planned for a later commit.
+#
+# KEYCHAIN_TOKEN_ITEM: Keychain item name holding the bot token
+# (`security find-generic-password -a "$USER" -s <name> -w`).
+KEYCHAIN_TOKEN_ITEM=comrades-tunnel-telegram-bot-token
+
+# KEYCHAIN_CHAT_ITEM: Keychain item name holding the target chat id.
+KEYCHAIN_CHAT_ITEM=comrades-tunnel-telegram-bot-chat
