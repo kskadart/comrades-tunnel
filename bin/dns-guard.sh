@@ -14,12 +14,28 @@
 # Settings come from a KEY=VALUE conf file, parsed with grep/cut only --
 # this script may run unattended as root via a LaunchDaemon and must never
 # `.`/source or eval file content:
-#   SERVERS   space-separated desired DNS servers (e.g. "1.1.1.1 1.0.0.1")
+#   SERVERS   space-separated desired DNS servers (e.g. "1.1.1.1 1.0.0.1"),
+#             or the single word "dhcp" to clear the manual list instead
+#             (`networksetup -setdnsservers <service> Empty`) so the
+#             service falls back to whatever DNS the current network's
+#             DHCP offers. Prefer "dhcp" on a laptop that moves between
+#             networks: a manual server list written here is stored in the
+#             service's Setup layer and stays in force on EVERY network
+#             until something rewrites it -- so a fixed "1.1.1.1" keeps
+#             overriding an office/home DHCP resolver long after the
+#             corporate client's rewrite that triggered it, whereas "dhcp"
+#             simply hands DNS back to the network you are on.
 #   MODE      "corp-only" -- intervene only when the current DNS list
 #             contains a corporate DNS server; "always" -- enforce SERVERS
 #             whenever the current list differs from it
 #   CORP_DNS  space-separated corporate DNS servers (required for
 #             MODE=corp-only, used to detect the corporate rewrite)
+#   KILLSWITCH_DNS  "auto" (default) -- when AmneziaVPN's Kill Switch has
+#             its pf anchor amn/310.blockDNS loaded, add CORP_DNS to that
+#             anchor's <dnsaddr> table so DNS queries to the corporate
+#             resolvers (port 53 through the corporate utun) are not
+#             dropped; "off" -- never touch pf. See the Kill Switch block
+#             below for why this is needed at all.
 #
 # Config source:
 #   default: <script-dir>/dns-guard.conf (the installed location, rendered
@@ -139,6 +155,18 @@ same_set() {
     [ "$s1" = "$s2" ]
 }
 
+# servers_means_dhcp SERVERS -- true if the (normalized) SERVERS value is
+# the single keyword "dhcp" (any letter case), i.e. the desired state is
+# "no manual DNS servers on the service; use the network's DHCP-offered
+# ones". networksetup spells that state "Empty", which is also accepted
+# here so `SERVERS=Empty` reads the same as the `make dns-reset` target.
+servers_means_dhcp() {
+    case "$1" in
+        [Dd][Hh][Cc][Pp]|[Ee][Mm][Pp][Tt][Yy]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # log MESSAGE -- timestamped append to LOG_FILE, falling back to stderr if
 # LOG_FILE cannot be written (e.g. running unprivileged). Moved above
 # run_self_test so --self-test can exercise it directly.
@@ -148,6 +176,104 @@ log() {
     if ! { printf '%s\n' "$line" >>"$LOG_FILE"; } 2>/dev/null; then
         printf '%s\n' "$line" >&2
     fi
+}
+
+# log_if_changed MESSAGE -- log MESSAGE only when it differs from the last
+# message logged this way (remembered in STATE_FILE). The daemon also runs
+# on a 30 s StartInterval (see the installer: Amnezia can replace its Kill
+# Switch DNS table on events that touch no watched file, e.g. the corporate
+# client connecting), and without this every such run would append the
+# same "ok current=[...]" line forever. Interventions, warnings and Kill
+# Switch additions still log every time through log(); an intervention
+# also forgets the remembered line, so the next "ok" is logged once again.
+STATE_FILE="/var/run/comrades-tunnel-dns-guard.state"
+log_if_changed() {
+    last=$(cat "$STATE_FILE" 2>/dev/null || true)
+    if [ "$last" != "$1" ]; then
+        log "$1"
+        { printf '%s\n' "$1" >"$STATE_FILE"; } 2>/dev/null || true
+    fi
+}
+
+# --- AmneziaVPN Kill Switch DNS exceptions (KILLSWITCH_DNS=auto) ---
+# AmneziaVPN's Kill Switch loads the pf anchor amn/310.blockDNS:
+#   block return out proto { tcp, udp } to port 53
+#   pass out proto { tcp, udp } to <dnsaddr> port 53
+# and fills <dnsaddr> with its own DNS servers only. Every query to the
+# corporate resolvers behind /etc/resolver/<zone> (port 53 through the
+# corporate utun) is therefore dropped and corporate names stop resolving,
+# while the corporate tunnel itself is fine (200.allowVPN passes every
+# utun). Amnezia has a "DNS exceptions" setting for exactly this, but on
+# macOS it never reaches the table for WireGuard/AmneziaWG (amnezia-client
+# issue #2513; still so on 5.0.1 -- the addresses sit in
+# Conf.allowedDnsServers, the table stays [1.1.1.1 1.0.0.1]). So this
+# daemon adds CORP_DNS to the table itself whenever the anchor is loaded.
+# Amnezia replaces the table on every (re)connect, and every (re)connect
+# also rewrites the system DNS, which is what fires this daemon via
+# WatchPaths -- plus a second look a few seconds later (finish), in case
+# the table is replaced after the DNS event that woke us.
+KS_ANCHOR="amn/310.blockDNS"
+KS_TABLE="dnsaddr"
+
+# killswitch_missing_dns CURRENT WANTED -- print the members of WANTED
+# (space-separated) that are not in CURRENT, in WANTED's order, space-
+# separated; empty when nothing is missing.
+killswitch_missing_dns() {
+    missing=""
+    for want in $2; do
+        found=0
+        for have in $1; do
+            if [ "$have" = "$want" ]; then
+                found=1
+                break
+            fi
+        done
+        [ "$found" = 0 ] && missing="$missing $want"
+    done
+    printf '%s\n' "${missing# }"
+}
+
+# ensure_killswitch_dns -- add whatever of CORP_DNS is missing from the
+# Kill Switch DNS table. No-op (and in --dry-run says why) when
+# KILLSWITCH_DNS=off, CORP_DNS is empty, we are not root (pf cannot even
+# be inspected unprivileged), or the anchor is not loaded (Kill Switch off
+# or Amnezia not connected).
+ensure_killswitch_dns() {
+    [ "$KILLSWITCH_DNS" = "auto" ] || return 0
+    [ -n "$CORP_DNS" ] || return 0
+    if [ "$(id -u)" != 0 ]; then
+        [ "$DRY_RUN" = 1 ] && echo "killswitch: pf needs root to inspect -- skipped in this unprivileged run"
+        return 0
+    fi
+    if ! current=$(pfctl -q -a "$KS_ANCHOR" -t "$KS_TABLE" -T show 2>/dev/null); then
+        [ "$DRY_RUN" = 1 ] && echo "killswitch: pf anchor $KS_ANCHOR not loaded (Amnezia Kill Switch off or not connected) -- nothing to do"
+        return 0
+    fi
+    current=$(normalize_list "$(printf '%s\n' "$current" | tr -d '\t' | tr '\n' ' ')")
+    missing=$(killswitch_missing_dns "$current" "$CORP_DNS")
+    if [ -z "$missing" ]; then
+        [ "$DRY_RUN" = 1 ] && echo "killswitch: table <$KS_TABLE> already has [$CORP_DNS] (table: [$current])"
+        return 0
+    fi
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "killswitch: would run: pfctl -a '$KS_ANCHOR' -t $KS_TABLE -T add $missing   (table now [$current])"
+        return 0
+    fi
+    if pfctl -q -a "$KS_ANCHOR" -t "$KS_TABLE" -T add $missing >/dev/null 2>&1; then
+        log "killswitch: added [$missing] to pf table $KS_ANCHOR <$KS_TABLE> (was [$current]) -- Amnezia ignores its own DNS exceptions on macOS, issue #2513"
+    else
+        log "WARNING: killswitch: pfctl -a '$KS_ANCHOR' -t $KS_TABLE -T add $missing failed"
+    fi
+}
+
+# finish -- the normal-path exit: one more look at the Kill Switch table a
+# few seconds later (see the block above), then exit 0.
+finish() {
+    if [ "$DRY_RUN" = 0 ] && [ "$KILLSWITCH_DNS" = "auto" ] && [ "$(id -u)" = 0 ]; then
+        sleep 5
+        ensure_killswitch_dns
+    fi
+    exit 0
 }
 
 # run_self_test: exercise service_for_interface (finding 11) against a
@@ -237,6 +363,47 @@ LISTING
         rm -rf "$f16_dir"
     fi
 
+    if servers_means_dhcp "dhcp" && servers_means_dhcp "DHCP" && servers_means_dhcp "Empty"; then
+        echo "PASS  [dhcp] servers_means_dhcp accepts dhcp/DHCP/Empty"
+    else
+        echo "FAIL  [dhcp] servers_means_dhcp rejected a valid keyword"
+        fail=1
+    fi
+    if servers_means_dhcp "1.1.1.1 1.0.0.1" || servers_means_dhcp "dhcp 1.1.1.1" || servers_means_dhcp ""; then
+        echo "FAIL  [dhcp] servers_means_dhcp accepted a real server list (or an empty one)"
+        fail=1
+    else
+        echo "PASS  [dhcp] servers_means_dhcp rejects real server lists and an empty value"
+    fi
+
+    st_dir=$(mktemp -d) || { echo "FAIL  [state] could not create a temp dir" >&2; fail=1; st_dir=""; }
+    if [ -n "$st_dir" ]; then
+        LOG_FILE="$st_dir/log"
+        STATE_FILE="$st_dir/state"
+        log_if_changed "service=Wi-Fi ok current=[]"
+        log_if_changed "service=Wi-Fi ok current=[]"
+        log_if_changed "service=Wi-Fi ok current=[1.1.1.1]"
+        log_if_changed "service=Wi-Fi ok current=[1.1.1.1]"
+        n=$(wc -l <"$LOG_FILE" | tr -d ' ')
+        if [ "$n" = 2 ] && grep -q 'current=\[\]' "$LOG_FILE" && grep -q 'current=\[1.1.1.1\]' "$LOG_FILE"; then
+            echo "PASS  [state] log_if_changed logs a repeated message once and a changed one again"
+        else
+            echo "FAIL  [state] log_if_changed wrote $n line(s), expected 2"
+            fail=1
+        fi
+        rm -rf "$st_dir"
+    fi
+
+    if [ "$(killswitch_missing_dns "1.1.1.1 1.0.0.1" "10.0.0.53 10.0.1.53")" = "10.0.0.53 10.0.1.53" ] && \
+       [ "$(killswitch_missing_dns "1.1.1.1 10.0.1.53 1.0.0.1" "10.0.0.53 10.0.1.53")" = "10.0.0.53" ] && \
+       [ -z "$(killswitch_missing_dns "10.0.1.53 1.1.1.1 10.0.0.53" "10.0.0.53 10.0.1.53")" ] && \
+       [ "$(killswitch_missing_dns "" "10.0.0.53")" = "10.0.0.53" ]; then
+        echo "PASS  [killswitch] killswitch_missing_dns reports exactly the corporate servers absent from the pf table"
+    else
+        echo "FAIL  [killswitch] killswitch_missing_dns gave an unexpected result"
+        fail=1
+    fi
+
     if [ "$fail" = 0 ]; then
         echo "self-test: all cases PASS"
     else
@@ -302,6 +469,7 @@ if [ -n "$CONFIG_DIR" ]; then
     fi
     SERVERS=$(grep '^SERVERS=' "$DNS_GUARD_TXT" | tail -1 | cut -d= -f2-)
     MODE=$(grep '^MODE=' "$DNS_GUARD_TXT" | tail -1 | cut -d= -f2-)
+    KILLSWITCH_DNS=$(grep '^KILLSWITCH_DNS=' "$DNS_GUARD_TXT" | tail -1 | cut -d= -f2-)
     CORP_DNS=$(normalize_list "$(read_lines "$CORP_DNS_TXT" | tr '\n' ' ')")
 else
     if [ ! -f "$CONF_FILE" ]; then
@@ -310,16 +478,25 @@ else
     fi
     SERVERS=$(grep '^SERVERS=' "$CONF_FILE" | tail -1 | cut -d= -f2-)
     MODE=$(grep '^MODE=' "$CONF_FILE" | tail -1 | cut -d= -f2-)
+    KILLSWITCH_DNS=$(grep '^KILLSWITCH_DNS=' "$CONF_FILE" | tail -1 | cut -d= -f2-)
     CORP_DNS=$(grep '^CORP_DNS=' "$CONF_FILE" | tail -1 | cut -d= -f2-)
 fi
 
 SERVERS=$(normalize_list "$SERVERS")
 MODE=$(normalize_list "$MODE")
 CORP_DNS=$(normalize_list "$CORP_DNS")
+KILLSWITCH_DNS=$(normalize_list "$KILLSWITCH_DNS")
 
 if [ -z "$SERVERS" ]; then
     echo "ERROR: SERVERS not set" >&2
     exit 2
+fi
+# SERVERS=dhcp: the desired state is an EMPTY manual list (DNS back to the
+# network's DHCP), spelled "Empty" for networksetup -setdnsservers.
+RESET_TO_DHCP=0
+if servers_means_dhcp "$SERVERS"; then
+    RESET_TO_DHCP=1
+    SERVERS="Empty"
 fi
 if [ -z "$MODE" ]; then
     MODE="corp-only"
@@ -330,6 +507,13 @@ if [ "$MODE" != "corp-only" ] && [ "$MODE" != "always" ]; then
 fi
 if [ "$MODE" = "corp-only" ] && [ -z "$CORP_DNS" ]; then
     echo "ERROR: MODE=corp-only requires CORP_DNS to be set" >&2
+    exit 2
+fi
+if [ -z "$KILLSWITCH_DNS" ]; then
+    KILLSWITCH_DNS="auto"
+fi
+if [ "$KILLSWITCH_DNS" != "auto" ] && [ "$KILLSWITCH_DNS" != "off" ]; then
+    echo "ERROR: KILLSWITCH_DNS must be 'auto' or 'off', got '$KILLSWITCH_DNS'" >&2
     exit 2
 fi
 
@@ -361,14 +545,18 @@ list_contains_any() {
     return 1
 }
 
+# Kill Switch first: independent of the DNS-list decision below, and the
+# corporate resolvers are useless while port 53 to them is dropped.
+ensure_killswitch_dns
+
 IFACE=$(default_interface)
 if [ -z "$IFACE" ]; then
     if [ "$DRY_RUN" = 1 ]; then
         echo "decision: ok (no primary interface found)"
     else
-        log "no primary interface found, nothing to do"
+        log_if_changed "no primary interface found, nothing to do"
     fi
-    exit 0
+    finish
 fi
 
 SERVICE=$(service_for_interface "$IFACE")
@@ -376,9 +564,9 @@ if [ -z "$SERVICE" ]; then
     if [ "$DRY_RUN" = 1 ]; then
         echo "decision: ok (no network service found for interface $IFACE)"
     else
-        log "no network service found for interface $IFACE, nothing to do"
+        log_if_changed "no network service found for interface $IFACE, nothing to do"
     fi
-    exit 0
+    finish
 fi
 
 CURRENT_LIST=$(normalize_list "$(current_dns_list "$SERVICE" | tr '\n' ' ')")
@@ -391,7 +579,11 @@ case "$MODE" in
         fi
         ;;
     always)
-        if ! same_set "$CURRENT_LIST" "$SERVERS"; then
+        if [ "$RESET_TO_DHCP" = 1 ]; then
+            # Desired state is "no manual list at all": any manual entry
+            # is a deviation.
+            [ -n "$CURRENT_LIST" ] && NEED_CHANGE=1
+        elif ! same_set "$CURRENT_LIST" "$SERVERS"; then
             NEED_CHANGE=1
         fi
         ;;
@@ -400,12 +592,25 @@ esac
 if [ "$NEED_CHANGE" = 1 ]; then
     if [ "$DRY_RUN" = 1 ]; then
         echo "decision: intervene (mode=$MODE) service=$SERVICE before=[$CURRENT_LIST]"
-        echo "would run: networksetup -setdnsservers \"$SERVICE\" $SERVERS"
-        exit 0
+        if [ "$RESET_TO_DHCP" = 1 ]; then
+            echo "would run: networksetup -setdnsservers \"$SERVICE\" Empty   (clear the manual list; DNS back to DHCP)"
+        else
+            echo "would run: networksetup -setdnsservers \"$SERVICE\" $SERVERS"
+        fi
+        finish
     fi
     networksetup -setdnsservers "$SERVICE" $SERVERS
+    rm -f "$STATE_FILE" 2>/dev/null || true
     AFTER_LIST=$(normalize_list "$(current_dns_list "$SERVICE" | tr '\n' ' ')")
-    if [ "$MODE" = "always" ] && ! same_set "$AFTER_LIST" "$SERVERS"; then
+    if [ "$RESET_TO_DHCP" = 1 ]; then
+        converged=0
+        [ -z "$AFTER_LIST" ] && converged=1
+    elif same_set "$AFTER_LIST" "$SERVERS"; then
+        converged=1
+    else
+        converged=0
+    fi
+    if [ "$MODE" = "always" ] && [ "$converged" = 0 ]; then
         # Re-read once after setting; if it still does not match, this is
         # not converging (some other process, or the OS itself, keeps
         # overriding it) -- log once and stop for this invocation instead
@@ -413,15 +618,19 @@ if [ "$NEED_CHANGE" = 1 ]; then
         # see the installer -- so "every tick" is every few seconds,
         # forever).
         log "WARNING: service=$SERVICE set SERVERS=[$SERVERS] but re-read shows [$AFTER_LIST] -- not converging; leaving it and exiting cleanly instead of rewriting every tick"
-        exit 0
+        finish
     fi
-    log "service=$SERVICE before=[$CURRENT_LIST] -> after=[$AFTER_LIST]"
+    if [ "$RESET_TO_DHCP" = 1 ]; then
+        log "service=$SERVICE before=[$CURRENT_LIST] -> after=[${AFTER_LIST:-<dhcp>}] (manual list cleared, DNS back to DHCP)"
+    else
+        log "service=$SERVICE before=[$CURRENT_LIST] -> after=[$AFTER_LIST]"
+    fi
 else
     if [ "$DRY_RUN" = 1 ]; then
         echo "decision: ok (mode=$MODE) service=$SERVICE current=[$CURRENT_LIST]"
-        exit 0
+        finish
     fi
-    log "service=$SERVICE ok current=[$CURRENT_LIST]"
+    log_if_changed "service=$SERVICE ok current=[$CURRENT_LIST]"
 fi
 
-exit 0
+finish

@@ -44,6 +44,33 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# resolve_config_dir REPO_ROOT DIR -- resolve a possibly-relative --config
+# DIR to an absolute path: an absolute DIR is returned unchanged; a
+# relative DIR is resolved against the current working directory when it
+# exists there (unchanged behaviour), else against REPO_ROOT (the script's
+# parent directory) instead, so `--config local` works from any CWD, not
+# just the repo root. A DIR that exists in neither location is returned as
+# a CWD-relative absolute path (still unresolved further) so the caller's
+# own "not found" error still names the path as given. Same helper as
+# check-split.sh/dns-guard.sh/install-dns-guard.sh/install-split-health.sh.
+resolve_config_dir() {
+    repo_root=$1
+    dir=$2
+    case "$dir" in
+        /*) printf '%s\n' "$dir"; return 0 ;;
+    esac
+    if [ -d "$dir" ]; then
+        (cd "$dir" && pwd)
+        return 0
+    fi
+    if [ -d "$repo_root/$dir" ]; then
+        (cd "$repo_root/$dir" && pwd)
+        return 0
+    fi
+    printf '%s/%s\n' "$(pwd)" "$dir"
+}
+CONFIG_DIR=$(resolve_config_dir "$REPO_ROOT" "$CONFIG_DIR")
+
 DOMAINS_FILE="$CONFIG_DIR/corp-domains.txt"
 DNS_FILE="$CONFIG_DIR/corp-dns.txt"
 OPTIONS_FILE="$CONFIG_DIR/corp-dns-options.txt"

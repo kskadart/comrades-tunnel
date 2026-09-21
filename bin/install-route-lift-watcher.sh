@@ -278,6 +278,10 @@ HELPDESK_LOG=$HELPDESK_LOG
 STATE_DIR=$STATE_DIR
 EOF
 
+# ProgramArguments runs the installed script directly (shebang + chmod 755
+# below), not "/bin/sh <script>", so macOS lists the daemon under "Allow in
+# the Background" as "route-lift-watcher.sh" instead of an anonymous "sh" --
+# see the same comment in install-dns-guard.sh.
 cat >"$TMP_PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -287,7 +291,6 @@ cat >"$TMP_PLIST" <<EOF
 	<string>$PLIST_LABEL</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/bin/sh</string>
 		<string>$WATCHER_DST</string>
 	</array>
 	<key>WatchPaths</key>

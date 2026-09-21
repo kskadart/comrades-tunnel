@@ -132,6 +132,14 @@ if [ ! -f "$SCRIPT_SRC" ]; then
     echo "ERROR: $SCRIPT_SRC not found" >&2
     exit 1
 fi
+# The LaunchAgent execs the script itself (see the ProgramArguments comment
+# below), so it must carry its executable bit -- git tracks it as 100755,
+# but a copy made through something that drops modes would silently leave
+# launchd unable to start the agent at all.
+if [ ! -x "$SCRIPT_SRC" ]; then
+    echo "ERROR: $SCRIPT_SRC is not executable (chmod 755 it): the LaunchAgent runs it directly" >&2
+    exit 1
+fi
 if [ ! -d "$ABS_CONFIG_DIR" ]; then
     echo "ERROR: config dir $ABS_CONFIG_DIR not found" >&2
     exit 1
@@ -140,6 +148,13 @@ fi
 TMP_PLIST=$(mktemp)
 trap 'rm -f "$TMP_PLIST"' EXIT
 
+# ProgramArguments runs the script directly (#!/bin/sh shebang, mode 755)
+# rather than as "/bin/sh <script>": macOS names a background item after
+# argv[0] of its ProgramArguments, so the "/bin/sh" form is listed in System
+# Settings > Login Items & Extensions > "Allow in the Background" (and in the
+# "Background Items Added" notification) as an anonymous "sh"; this way it
+# is listed as "split-health.sh". Same rule as install-dns-guard.sh /
+# install-route-lift-watcher.sh.
 cat >"$TMP_PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -149,7 +164,6 @@ cat >"$TMP_PLIST" <<EOF
 	<string>$PLIST_LABEL</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/bin/sh</string>
 		<string>$SCRIPT_SRC</string>
 		<string>--config</string>
 		<string>$ABS_CONFIG_DIR</string>

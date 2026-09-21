@@ -38,7 +38,13 @@
 # and safe, so either interface passes.
 #
 # Usage: check-split.sh [--config DIR] [--mode {forward,exclude}]
-# Exit code: 0 if every expectation PASSed, 1 otherwise.
+# Exit code: 0 if every expectation PASSed, 1 otherwise. A corp-hosts-
+# check.txt host that does not resolve while the corporate utun is up is a
+# FAIL too: corporate DNS (/etc/resolver/<zone>, reached through that
+# tunnel) should have answered, so its routing simply could not be verified
+# -- typically DNS through the tunnel is being dropped locally (another VPN
+# client's kill switch; README «Диагностика проблем» п. 5). With the
+# corporate VPN down the same host is only a WARN and is skipped.
 
 set -u
 
@@ -139,6 +145,7 @@ dscacheutil_bounded() {
 
 FAIL_COUNT=0
 TOTAL_COUNT=0
+NORESOLVE_COUNT=0
 
 count_result() {
     # count_result <status: 0=pass 1=fail> -- tally only, the table row
@@ -225,7 +232,16 @@ for host in $HOSTS; do
     test_ip=${dscache_ip:-$dig_ip}
 
     if [ -z "$test_ip" ]; then
-        printf '  %-52s %-16s %-16s %-10s %-10s %s\n' "$host" "-" "-" "-" "-" "WARN(no resolve)"
+        NORESOLVE_COUNT=$((NORESOLVE_COUNT + 1))
+        if [ -n "$CP_UTUN" ]; then
+            # Corporate tunnel up, corporate DNS should have answered: this
+            # host's routing could not be verified at all -- a FAIL, not a
+            # footnote (see the explanation printed after the table).
+            printf '  %-52s %-16s %-16s %-10s %-10s %s\n' "$host" "-" "-" "-" "-" "FAIL(no resolve)"
+            count_result 1
+        else
+            printf '  %-52s %-16s %-16s %-10s %-10s %s\n' "$host" "-" "-" "-" "-" "WARN(no resolve)"
+        fi
         continue
     fi
 
@@ -273,6 +289,16 @@ for host in $HOSTS; do
     fi
     count_result "$result_status"
 done
+
+if [ "$NORESOLVE_COUNT" -gt 0 ]; then
+    if [ -n "$CP_UTUN" ]; then
+        echo "  $NORESOLVE_COUNT host(s) did not resolve although the corporate utun ($CP_UTUN) is up: their routing was NOT verified."
+        echo "  Corporate DNS unreachable through the tunnel? If the corporate client says Connected, check whether another VPN"
+        echo "  client's kill switch (pf) drops DNS through the tunnel -- README, «Диагностика проблем», п. 5."
+    else
+        echo "  $NORESOLVE_COUNT host(s) did not resolve: corporate VPN is down (no utun with prefix ${CORP_TUNNEL_PREFIX:-<unset>}); skipped, not verified."
+    fi
+fi
 
 echo
 echo "=== public IPs / direct-domain (before Amnezia import, some FAIL is expected) ==="
@@ -344,6 +370,9 @@ fi
 echo
 echo "=== summary ==="
 echo "  $((TOTAL_COUNT - FAIL_COUNT))/$TOTAL_COUNT checks PASSED"
+if [ "$NORESOLVE_COUNT" -gt 0 ]; then
+    echo "  $NORESOLVE_COUNT corp host(s) not resolved -- routing not verified (see the corp-hosts-check.txt table)"
+fi
 if [ "$FAIL_COUNT" = 0 ]; then
     echo "All checks PASSED"
     exit 0

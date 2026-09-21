@@ -1,10 +1,23 @@
 # Settings for bin/dns-guard.sh (see install-dns-guard.sh for how this is
 # rendered into the installed dns-guard.conf).
 #
-# SERVERS: space-separated DNS servers to enforce on the primary network
-# service, e.g. the personal VPN's own resolvers. These are placeholders --
-# use whatever your personal VPN/DNS provider expects.
-SERVERS=1.1.1.1 1.0.0.1
+# SERVERS: what to put on the primary network service once the guard
+# decides to act. Either a space-separated list of DNS servers to set as
+# the service's manual list (e.g. the personal VPN's own resolvers -- the
+# values below are placeholders), or the single word "dhcp" to CLEAR the
+# manual list instead (networksetup -setdnsservers <service> Empty) so DNS
+# falls back to whatever the current network's DHCP offers.
+#
+# "dhcp" is the right choice for a laptop that moves between networks: a
+# manual list lives in the service's Setup layer and stays in force on
+# EVERY network until something rewrites it, so a fixed public resolver
+# set here keeps overriding the office/home DHCP resolver long after the
+# corporate client's rewrite that triggered it (and a corporate firewall
+# may not even let port 53 out to a public resolver). Clearing the list
+# just hands DNS back to the network you are on; corporate zones keep
+# resolving through /etc/resolver/<zone> either way.
+SERVERS=dhcp
+# SERVERS=1.1.1.1 1.0.0.1
 
 # MODE: "corp-only" only reverts the DNS list when it currently contains one
 # of the corporate DNS servers listed in corp-dns.txt (i.e. right after the
@@ -13,6 +26,15 @@ SERVERS=1.1.1.1 1.0.0.1
 # enforces SERVERS whenever the current list differs from it, regardless of
 # what changed it.
 MODE=corp-only
+
+# KILLSWITCH_DNS: "auto" (default) -- if AmneziaVPN's Kill Switch is on, add
+# the servers from corp-dns.txt to its pf DNS-exceptions table
+# (amn/310.blockDNS <dnsaddr>) whenever the guard runs. The Kill Switch
+# blocks port 53 to everything but Amnezia's own DNS servers, which cuts
+# off the corporate resolvers behind /etc/resolver/<zone>; Amnezia's own
+# "DNS exceptions" setting does not reach that table on macOS
+# (amnezia-client issue #2513, still so on 5.0.1). "off" -- never touch pf.
+KILLSWITCH_DNS=auto
 
 # CORP_DNS is not set here: dns-guard.sh derives it from corp-dns.txt
 # (the same file install-resolvers.sh reads) when run with --config DIR,

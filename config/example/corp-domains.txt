@@ -1,5 +1,13 @@
 # Corporate DNS zones served by split-horizon DNS.
 # One domain per line. install-resolvers.sh renders /etc/resolver/<domain>
 # for each of these, pointing at the nameservers in corp-dns.txt.
+#
+# Matching is by suffix, so a single host works as a "zone" too: list e.g.
+# owa.corp-public.example when only that name is internal-only (corporate
+# DNS answers a private address, public DNS a public one that serves
+# something else) and the rest of corp-public.example must stay on public
+# DNS -- an entry for the whole corp-public.example would make its public
+# names unresolvable while the corporate VPN is down (macOS never falls
+# back from a zone-specific resolver to the main one).
 corp.example
 intra.example

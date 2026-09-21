@@ -251,6 +251,16 @@ age_seconds() {
 # code -- kept only for parity/self-test coverage).
 TICK_LOCK_HELD=0
 acquire_lock() {
+    # The lock lives under STATE_DIR, which does not exist yet on the very
+    # first tick of a fresh install (state_write creates it lazily). Without
+    # this, that first `mkdir "$LOCK_DIR"` fails with ENOENT, the pid file
+    # cannot be read, age_seconds finds nothing to stat, and the tick logs a
+    # spurious SKIP=lock-held and exits without running a single check -- so
+    # the RunAtLoad tick right after `make health-install` was always lost.
+    # (bin/route-lift-watcher.sh avoids this by `mkdir -p`-ing its STATE_DIR
+    # right before its own acquire_lock; done inside the function here so
+    # --self-test can cover it directly -- case (e3).)
+    mkdir -p "$(dirname "$LOCK_DIR")" 2>/dev/null
     if mkdir "$LOCK_DIR" 2>/dev/null; then
         echo $$ >"$LOCK_DIR/pid" 2>/dev/null
         return 0
@@ -648,6 +658,19 @@ if [ "$SELF_TEST" = 1 ]; then
     fi
     TICK_LOCK_HELD=1
     release_lock_if_held
+
+    # (e3) fresh install: STATE_DIR (the lock's parent) does not exist yet.
+    # acquire_lock must create it and take the lock, not report it "held" --
+    # otherwise the first tick after `make health-install` is silently lost.
+    fresh_lock="$ST_TMPDIR/fresh-state/lock"
+    LOCK_DIR="$fresh_lock"
+    if acquire_lock && [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; then
+        st_check "(e3) acquire_lock takes the lock when its parent state dir does not exist yet (first tick after install)" 0
+    else
+        st_check "(e3) acquire_lock takes the lock when its parent state dir does not exist yet (first tick after install)" 1
+    fi
+    TICK_LOCK_HELD=1
+    release_lock_if_held
     LOCK_DIR="$lock_dir_saved"
 
     # --- (f) resolve_keychain_item: telegram.txt present overrides the
@@ -817,17 +840,26 @@ AMNEZIA_ROUTES=0
 
 # =========================================================================
 # Check 1 -- FAIL: corporate host/gateway/netblock routed via personal VPN
+#            WARN: a corp-hosts-check.txt host does not resolve while the
+#                  corporate utun is up (routing unverifiable: corporate DNS
+#                  unreachable through the tunnel -- e.g. another VPN
+#                  client's kill switch; README «Диагностика проблем» п. 5)
 # =========================================================================
 CORP_LEAK_STATUS=OK
 CORP_LEAK_EVIDENCE="ни один хост из corp-hosts-check.txt, ни сеть/шлюз из direct-cidrs.txt не идёт через личный VPN"
 CORP_LEAK_HIT=0
+CORP_LEAK_NORESOLVE=0
 CORP_LEAK_TABLE=""
 
 for host in $(read_lines "$CONFIG_DIR/corp-hosts-check.txt"); do
     dscache_ip=$(dscacheutil_bounded "$host")
     dig_ip=$(dig +short +time=2 +tries=1 A "$host" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
     test_ip=${dscache_ip:-$dig_ip}
-    [ -z "$test_ip" ] && continue
+    if [ -z "$test_ip" ]; then
+        CORP_LEAK_NORESOLVE=$((CORP_LEAK_NORESOLVE + 1))
+        CORP_LEAK_TABLE="${CORP_LEAK_TABLE}$(printf '  %-42s %-16s %s' "$host" "-" "(no resolve)")${NL}"
+        continue
+    fi
     iface=$(route_iface "$test_ip")
     CORP_LEAK_TABLE="${CORP_LEAK_TABLE}$(printf '  %-42s %-16s %s' "$host" "$test_ip" "${iface:--}")${NL}"
     if [ -n "$AMNEZIA_UTUN" ] && [ "$iface" = "$AMNEZIA_UTUN" ]; then
@@ -853,6 +885,19 @@ if [ "$CORP_LEAK_HIT" = 0 ]; then
             fi
         done
     done
+fi
+
+# No leak found, but some corporate hosts could not be resolved while the
+# corporate tunnel is up: corporate DNS (reached through that tunnel via
+# /etc/resolver/<zone>) should have answered, so their routing is simply
+# unverified. WARN rather than silence, so the transition gets noticed:
+# on 2026-09-18 AmneziaVPN 5.0.1's kill switch dropped every packet into
+# the Check Point utun for an hour of all-OK ticks, because the loop above
+# just skipped the unresolvable hosts. With the corporate VPN down the same
+# hosts are expected not to resolve and stay silent.
+if [ "$CORP_LEAK_HIT" = 0 ] && [ "$CORP_LEAK_NORESOLVE" -gt 0 ] && [ -n "$CP_UTUN" ]; then
+    CORP_LEAK_STATUS=WARN
+    CORP_LEAK_EVIDENCE="$CORP_LEAK_NORESOLVE хост(ов) из corp-hosts-check.txt не резолвятся, хотя корпоративный utun ($CP_UTUN) поднят -- их маршрутизация не проверена; корпоративный DNS через туннель недоступен? (kill switch другого VPN-клиента -- README, «Диагностика проблем», п. 5)"
 fi
 
 # =========================================================================

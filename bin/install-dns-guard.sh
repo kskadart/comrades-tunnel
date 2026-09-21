@@ -21,11 +21,22 @@
 # there. The installer verifies the ancestor chain with assert_safe_path
 # instead of assuming it: --dry-run reports, --apply hard-refuses.
 #
+# The daemon is triggered by WatchPaths (the system DNS files), RunAtLoad,
+# and a 30 s StartInterval. The interval exists for the Kill Switch part of
+# dns-guard.sh: AmneziaVPN replaces its pf DNS-exceptions table on events
+# that touch no watched file (seen 2026-09-18: the corporate client
+# connecting made Amnezia re-apply its firewall a moment after the DNS
+# rewrite that had already woken the guard), and nothing else can observe
+# a pf table. A run costs a networksetup read and a pfctl show; steady-state
+# "ok" lines are logged only on change (log_if_changed), so the interval
+# does not flood the log.
+#
 # Renders:
 #   /Library/Application Support/comrades-tunnel/dns-guard.sh    (copy of
 #       bin/dns-guard.sh)
 #   /Library/Application Support/comrades-tunnel/dns-guard.conf  (KEY=VALUE,
-#       from DIR/dns-guard.txt + DIR/corp-dns.txt)
+#       from DIR/dns-guard.txt (SERVERS, MODE, KILLSWITCH_DNS) +
+#       DIR/corp-dns.txt (CORP_DNS))
 #   /Library/LaunchDaemons/dev.comrades-tunnel.dns-guard.plist
 #
 # Default action is --dry-run: prints each rendered file and a diff against
@@ -196,9 +207,11 @@ fi
 
 SERVERS=$(grep '^SERVERS=' "$DNS_GUARD_TXT" | tail -1 | cut -d= -f2-)
 MODE=$(grep '^MODE=' "$DNS_GUARD_TXT" | tail -1 | cut -d= -f2-)
+KILLSWITCH_DNS=$(grep '^KILLSWITCH_DNS=' "$DNS_GUARD_TXT" | tail -1 | cut -d= -f2-)
 CORP_DNS=$(normalize_list "$(read_lines "$CORP_DNS_TXT" | tr '\n' ' ')")
 SERVERS=$(normalize_list "$SERVERS")
 MODE=$(normalize_list "$MODE")
+KILLSWITCH_DNS=$(normalize_list "$KILLSWITCH_DNS")
 
 if [ -z "$SERVERS" ]; then
     echo "ERROR: SERVERS not set in $DNS_GUARD_TXT" >&2
@@ -206,6 +219,13 @@ if [ -z "$SERVERS" ]; then
 fi
 if [ -z "$MODE" ]; then
     MODE="corp-only"
+fi
+if [ -z "$KILLSWITCH_DNS" ]; then
+    KILLSWITCH_DNS="auto"
+fi
+if [ "$KILLSWITCH_DNS" != "auto" ] && [ "$KILLSWITCH_DNS" != "off" ]; then
+    echo "ERROR: KILLSWITCH_DNS must be 'auto' or 'off' in $DNS_GUARD_TXT, got '$KILLSWITCH_DNS'" >&2
+    exit 1
 fi
 
 echo "Checking path safety:"
@@ -221,8 +241,16 @@ cat >"$TMP_CONF" <<EOF
 SERVERS=$SERVERS
 MODE=$MODE
 CORP_DNS=$CORP_DNS
+KILLSWITCH_DNS=$KILLSWITCH_DNS
 EOF
 
+# ProgramArguments runs the installed script directly (it has a #!/bin/sh
+# shebang and is chmod 755 below) rather than as "/bin/sh <script>": macOS
+# names a background item after argv[0] of its ProgramArguments, so the
+# "/bin/sh" form shows up in System Settings > Login Items & Extensions >
+# "Allow in the Background" (and in the "Background Items Added"
+# notification) as an anonymous "sh", indistinguishable from any other
+# shell-script daemon; this way it is listed as "dns-guard.sh".
 cat >"$TMP_PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -232,7 +260,6 @@ cat >"$TMP_PLIST" <<EOF
 	<string>$PLIST_LABEL</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/bin/sh</string>
 		<string>$GUARD_SCRIPT_DST</string>
 	</array>
 	<key>WatchPaths</key>
@@ -244,6 +271,8 @@ cat >"$TMP_PLIST" <<EOF
 	<true/>
 	<key>ThrottleInterval</key>
 	<integer>3</integer>
+	<key>StartInterval</key>
+	<integer>30</integer>
 	<key>StandardOutPath</key>
 	<string>$LOG_FILE</string>
 	<key>StandardErrorPath</key>

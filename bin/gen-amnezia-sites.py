@@ -442,12 +442,32 @@ def self_test(fallback_dns: str) -> int:
     within_cap = elapsed2 <= DNS_FALLBACK_TIMEOUT + 1.0  # scheduling slack
     print(f"    result: {ips2} ({elapsed2:.2f}s, within {DNS_FALLBACK_TIMEOUT}s cap: {within_cap})")
     negative_ok = (not raised) and ips2 == [] and within_cap
+    # A non-routable resolver that nevertheless ANSWERS means something on
+    # the path (typically the home router or the ISP) transparently
+    # intercepts UDP/53 and answers every DNS query itself, whoever it was
+    # addressed to. That is a property of the network, not a defect of
+    # dns_query_a(): the client did not hang and did not raise, it simply
+    # could not exercise its timeout path here. Report it as a WARNING
+    # rather than a FAIL -- and say so explicitly, because on such a
+    # network --fallback-dns is answered by the interceptor too.
+    intercepted = (not raised) and bool(ips2) and within_cap
     check_label = "negative case timed out within the cap and did not raise"
-    print(f"  [{'PASS' if negative_ok else 'FAIL'}] {check_label}")
-    ok = ok and negative_ok
+    if intercepted:
+        print("  [WARN] negative case was ANSWERED: a query to non-routable "
+              f"{non_routable} got a real reply, so this network transparently "
+              "intercepts UDP/53 (router/ISP DNS proxy); the timeout path could "
+              "not be exercised here. Not a client defect -- but note that on "
+              f"this network --fallback-dns ({fallback_dns}) is answered by that "
+              "interceptor, not by the resolver you named.")
+    else:
+        print(f"  [{'PASS' if negative_ok else 'FAIL'}] {check_label}")
+    ok = ok and (negative_ok or intercepted)
 
     print()
-    print("Self-test " + ("PASSED" if ok else "FAILED"))
+    if ok and intercepted:
+        print("Self-test PASSED (with a WARNING: DNS interception on this network)")
+    else:
+        print("Self-test " + ("PASSED" if ok else "FAILED"))
     return 0 if ok else 1
 
 
