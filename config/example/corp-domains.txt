@@ -7,7 +7,10 @@
 # DNS answers a private address, public DNS a public one that serves
 # something else) and the rest of corp-public.example must stay on public
 # DNS -- an entry for the whole corp-public.example would make its public
-# names unresolvable while the corporate VPN is down (macOS never falls
-# back from a zone-specific resolver to the main one).
+# names unresolvable while the corporate VPN is down. Note that while the
+# VPN is down such a name may also get its PUBLIC address cached by the
+# system resolver for the record's TTL; bin/dns-guard.sh flushes the
+# resolver cache when the corporate VPN comes up so the next lookup goes
+# to the corporate DNS again.
 corp.example
 intra.example

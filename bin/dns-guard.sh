@@ -266,6 +266,22 @@ ensure_killswitch_dns() {
     fi
 }
 
+# flush_dns_cache -- drop mDNSResponder's cache right after the corporate
+# client rewrote the DNS list, i.e. right after the corporate VPN came up.
+# While it was down, a lookup of an internal-only name behind
+# /etc/resolver/<zone> could not reach the corporate resolvers, and the
+# system resolver ended up caching that name's PUBLIC address for the
+# record's full TTL (seen 2026-09-21: the corporate webmail host kept
+# landing on the public server's 404 page for most of an hour after the
+# tunnel was up, while a direct query to the corporate DNS already gave
+# the internal address). Connecting the VPN does not invalidate that
+# cache; this does, so the next lookup goes to the corporate resolver,
+# which is reachable now.
+flush_dns_cache() {
+    dscacheutil -flushcache 2>/dev/null || true
+    killall -HUP mDNSResponder 2>/dev/null || true
+}
+
 # finish -- the normal-path exit: one more look at the Kill Switch table a
 # few seconds later (see the block above), then exit 0.
 finish() {
@@ -597,10 +613,12 @@ if [ "$NEED_CHANGE" = 1 ]; then
         else
             echo "would run: networksetup -setdnsservers \"$SERVICE\" $SERVERS"
         fi
+        echo "would run: dscacheutil -flushcache; killall -HUP mDNSResponder   (drop answers cached while the corporate VPN was down)"
         finish
     fi
     networksetup -setdnsservers "$SERVICE" $SERVERS
     rm -f "$STATE_FILE" 2>/dev/null || true
+    flush_dns_cache
     AFTER_LIST=$(normalize_list "$(current_dns_list "$SERVICE" | tr '\n' ' ')")
     if [ "$RESET_TO_DHCP" = 1 ]; then
         converged=0
@@ -621,9 +639,9 @@ if [ "$NEED_CHANGE" = 1 ]; then
         finish
     fi
     if [ "$RESET_TO_DHCP" = 1 ]; then
-        log "service=$SERVICE before=[$CURRENT_LIST] -> after=[${AFTER_LIST:-<dhcp>}] (manual list cleared, DNS back to DHCP)"
+        log "service=$SERVICE before=[$CURRENT_LIST] -> after=[${AFTER_LIST:-<dhcp>}] (manual list cleared, DNS back to DHCP; resolver cache flushed)"
     else
-        log "service=$SERVICE before=[$CURRENT_LIST] -> after=[$AFTER_LIST]"
+        log "service=$SERVICE before=[$CURRENT_LIST] -> after=[$AFTER_LIST] (resolver cache flushed)"
     fi
 else
     if [ "$DRY_RUN" = 1 ]; then
