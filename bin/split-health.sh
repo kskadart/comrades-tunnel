@@ -510,6 +510,19 @@ import_mismatch_diff() {
 # LAST_RUN_FILE is missing/unreadable/non-numeric; the caller must then
 # seed it and skip this tick, so a fresh install never runs this on its
 # very first tick.
+# registry_diff_base_evidence EVIDENCE -- EVIDENCE without the age note that
+# check 5b appends on ticks between two registry refreshes. That note is
+# persisted together with the evidence, and the next tick reads the evidence
+# back from state, so without stripping it first every tick appended one
+# more "(последняя проверка ...)" -- the evidence grew by ~40 bytes per tick
+# forever (18 KB after a week) and flooded --status / notifications.
+registry_diff_base_evidence() {
+    e=$1
+    e=${e%% (последняя проверка *}
+    e=${e%% (срок настал *}
+    printf '%s\n' "$e"
+}
+
 registry_diff_is_due() {
     last_run_file=$1
     sites_file=$2
@@ -625,6 +638,13 @@ if [ "$SELF_TEST" = 1 ]; then
     set -- $(registry_diff_is_due "$rd_last_run_file" "$rd_sites_file" "$RD_NOW" 1)
     st_check "(d5) FORCE=1 is due regardless of timestamp/list age" \
         "$([ "$1" = 1 ] && echo 0 || echo 1)"
+
+    # (d6) the age note is not re-appended on every tick: stripping a note
+    # (or a pile of them, as older versions persisted) leaves the base text.
+    rd_base="сверка с реестром показала изменения: +65/-7 сетей -- перегенерируйте"
+    rd_piled="$rd_base (последняя проверка 0д назад; раз в 7 дней) (последняя проверка 1д назад; раз в 7 дней)"
+    st_check "(d6) the persisted age note is stripped before a new one is appended" \
+        "$([ "$(registry_diff_base_evidence "$rd_piled")" = "$rd_base" ] && [ "$(registry_diff_base_evidence "$rd_base")" = "$rd_base" ] && [ "$(registry_diff_base_evidence "$rd_base (срок настал 8д назад, но x -- сверка отложена)")" = "$rd_base" ] && echo 0 || echo 1)"
 
     # --- (e) single-instance tick lock: acquire_lock leaves a live-owned
     # lock alone, but breaks and re-acquires a lock whose owner is dead
@@ -1200,7 +1220,7 @@ elif [ "$REGISTRY_DIFF_HAD_TIMESTAMP" = 0 ]; then
     REGISTRY_DIFF_EVIDENCE="первая сверка с реестром отложена -- отметка времени только что установлена, следующая попытка через 7 дней"
 else
     REGISTRY_DIFF_STATUS=$(state_read REGISTRY_DIFF STATUS)
-    REGISTRY_DIFF_EVIDENCE=$(state_read REGISTRY_DIFF EVIDENCE)
+    REGISTRY_DIFF_EVIDENCE=$(registry_diff_base_evidence "$(state_read REGISTRY_DIFF EVIDENCE)")
     [ -z "$REGISTRY_DIFF_STATUS" ] && REGISTRY_DIFF_STATUS=OK
     [ -z "$REGISTRY_DIFF_EVIDENCE" ] && REGISTRY_DIFF_EVIDENCE="сверка с реестром ещё не выполнялась"
     RD_AGE_DAYS=$(( (NOW - REGISTRY_DIFF_LAST_RUN) / 86400 ))
