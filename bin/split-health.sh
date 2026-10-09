@@ -1142,6 +1142,13 @@ SYMPTOM_SKIPPED_NOTE=""
 if [ "$SYMPTOM_ATTEMPTED" -eq 0 ]; then
     SYMPTOM_LIVE_STATUS=OK
     SYMPTOM_LIVE_EVIDENCE="нет доменов/хостов для живой проверки"
+elif [ "$SYMPTOM_RESOLVED" -eq 0 ] && [ "$SYMPTOM_ATTEMPTED" -ge 3 ] && [ -n "$AMNEZIA_UTUN" ]; then
+    # Nothing resolves although the personal VPN is up: not "no network"
+    # but dead DNS -- AmneziaVPN's DNS override lost under its Kill Switch
+    # (seen twice, both times right after the corporate VPN connected).
+    # WARN so the transition is notified instead of logged as INFO.
+    SYMPTOM_LIVE_STATUS=WARN
+    SYMPTOM_LIVE_EVIDENCE="не резолвится ни один из $SYMPTOM_ATTEMPTED адресов при поднятом личном VPN ($AMNEZIA_UTUN) -- DNS не работает; вероятно, Amnezia потеряла свою подмену DNS при включённом Kill Switch (README, «Диагностика проблем», п. 7)$SYMPTOM_SKIPPED_NOTE"
 elif [ "$SYMPTOM_RESOLVED" -eq 0 ] && [ "$SYMPTOM_ATTEMPTED" -ge 3 ]; then
     SYMPTOM_LIVE_STATUS=INFO
     SYMPTOM_LIVE_EVIDENCE="живая проверка не смогла резолвить ни один из $SYMPTOM_ATTEMPTED адресов (сети нет?) -- пропущено в этом тике$SYMPTOM_SKIPPED_NOTE"

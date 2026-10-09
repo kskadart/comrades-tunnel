@@ -35,7 +35,9 @@
 #             anchor's <dnsaddr> table so DNS queries to the corporate
 #             resolvers (port 53 through the corporate utun) are not
 #             dropped; "off" -- never touch pf. See the Kill Switch block
-#             below for why this is needed at all.
+#             below for why this is needed at all. "auto" also re-applies
+#             AmneziaVPN's own DNS override when it gets lost while the
+#             Kill Switch is on (see ensure_amnezia_dns below).
 #
 # Config source:
 #   default: <script-dir>/dns-guard.conf (the installed location, rendered
@@ -282,12 +284,111 @@ flush_dns_cache() {
     killall -HUP mDNSResponder 2>/dev/null || true
 }
 
-# finish -- the normal-path exit: one more look at the Kill Switch table a
-# few seconds later (see the block above), then exit 0.
+# --- AmneziaVPN's DNS override (KILLSWITCH_DNS=auto) ---
+# On connect, AmneziaVPN writes its own DNS into the LIVE copy of every
+# network service's settings (Setup:/Network/Service/<id>/DNS in the
+# dynamic store): ServerAddresses = its resolvers, DomainName = "lan", and
+# no SearchDomains. It never watches that key afterwards (amnezia-client
+# client/platforms/macos/daemon/dnsutilsmacos.cpp: no change callback).
+# Any write to the network PREFERENCES -- the corporate client prepending
+# its servers on connect, this guard clearing them again -- makes configd
+# rebuild the live copy from the preferences, and Amnezia's override is
+# gone until Amnezia reconnects. The system then asks the network's DHCP
+# resolvers, and with the Kill Switch on, 310.blockDNS drops port 53 to
+# them: every public name stops resolving while corporate names (their
+# servers are in the table, see above) keep working. Seen 2026-09-18 01:53
+# and 2026-10-09 16:09-16:20, both times Amnezia connected first and the
+# corporate VPN second. Even while the override holds, it drops the
+# corporate search domains, so short intranet names stop resolving.
+#
+# ensure_amnezia_dns restores the override on the primary service when the
+# Kill Switch anchor is loaded and Amnezia's tunnel process runs: servers =
+# the Kill Switch DNS table minus CORP_DNS (i.e. Amnezia's own resolvers),
+# search domains = whatever the live copy has plus the ones saved in the
+# preferences (where the corporate client puts its search domains). It only
+# touches the dynamic store, never the preferences, so nothing persists
+# past Amnezia's own restore on disconnect or a reboot.
+
+# scutil_array KEY -- members of array KEY in `scutil` "show" output read
+# from stdin, space-separated (empty if KEY is absent).
+scutil_array() {
+    awk -v key="$1" '
+        $1 == key && $2 == ":" && $3 == "<array>" { inarr = 1; next }
+        inarr && $1 == "}" { exit }
+        inarr && $2 == ":" { printf "%s%s", sep, $3; sep = " " }
+    '
+}
+
+# list_minus A B -- members of space-separated A that are not in B, in A's
+# order, space-separated.
+list_minus() {
+    killswitch_missing_dns "$2" "$1"
+}
+
+amnezia_tunnel_running() {
+    pgrep -x amneziawg-go >/dev/null 2>&1 || pgrep -x wireguard-go >/dev/null 2>&1
+}
+
+ensure_amnezia_dns() {
+    [ "$KILLSWITCH_DNS" = "auto" ] || return 0
+    if [ "$(id -u)" != 0 ]; then
+        [ "$DRY_RUN" = 1 ] && echo "amnezia-dns: pf needs root to inspect -- skipped in this unprivileged run"
+        return 0
+    fi
+    if ! table=$(pfctl -q -a "$KS_ANCHOR" -t "$KS_TABLE" -T show 2>/dev/null) || ! amnezia_tunnel_running; then
+        [ "$DRY_RUN" = 1 ] && echo "amnezia-dns: Amnezia Kill Switch not active -- nothing to do"
+        return 0
+    fi
+    table=$(normalize_list "$(printf '%s\n' "$table" | tr -d '\t' | tr '\n' ' ')")
+    want=$(list_minus "$table" "$CORP_DNS")
+    [ -n "$want" ] || return 0
+    sid=$(printf 'show State:/Network/Global/IPv4\n' | scutil 2>/dev/null | awk '$1 == "PrimaryService" {print $3; exit}')
+    [ -n "$sid" ] || return 0
+    live=$(printf 'show Setup:/Network/Service/%s/DNS\n' "$sid" | scutil 2>/dev/null)
+    live_servers=$(printf '%s\n' "$live" | scutil_array ServerAddresses)
+    live_search=$(printf '%s\n' "$live" | scutil_array SearchDomains)
+    saved_search=""
+    if [ -n "${SERVICE:-}" ]; then
+        saved_search=$(networksetup -getsearchdomains "$SERVICE" 2>/dev/null || true)
+        case "$saved_search" in
+            "There aren't any"*) saved_search="" ;;
+        esac
+        saved_search=$(normalize_list "$(printf '%s\n' "$saved_search" | tr '\n' ' ')")
+    fi
+    add_search=$(list_minus "$saved_search" "$live_search")
+    if same_set "$live_servers" "$want" && [ -z "$add_search" ]; then
+        [ "$DRY_RUN" = 1 ] && echo "amnezia-dns: ok -- primary service uses Amnezia's DNS [$want], search [$live_search]"
+        return 0
+    fi
+    new_search=$(normalize_list "$live_search $add_search")
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "amnezia-dns: would set Setup:/Network/Service/$sid/DNS servers [$live_servers] -> [$want], search [$live_search] -> [$new_search]"
+        return 0
+    fi
+    {
+        printf 'd.init\n'
+        printf 'd.add ServerAddresses * %s\n' "$want"
+        [ -n "$new_search" ] && printf 'd.add SearchDomains * %s\n' "$new_search"
+        printf 'set Setup:/Network/Service/%s/DNS\n' "$sid"
+    } | scutil
+    flush_dns_cache
+    log "amnezia-dns: restored Amnezia's DNS override on the primary service: servers [$live_servers] -> [$want], search [$live_search] -> [$new_search]"
+}
+
+# finish -- the normal-path exit. With the Kill Switch active: restore
+# Amnezia's DNS override (the DNS-list intervention above is exactly what
+# drops it), then one more look at both a few seconds later, in case
+# Amnezia or configd rewrote something after the event that woke us.
+# Without an active Kill Switch there is nothing to wait for.
 finish() {
-    if [ "$DRY_RUN" = 0 ] && [ "$KILLSWITCH_DNS" = "auto" ] && [ "$(id -u)" = 0 ]; then
+    if [ "$DRY_RUN" = 1 ]; then
+        ensure_amnezia_dns
+    elif [ "$KILLSWITCH_DNS" = "auto" ] && [ "$(id -u)" = 0 ] && \
+         pfctl -q -a "$KS_ANCHOR" -t "$KS_TABLE" -T show >/dev/null 2>&1; then
+        ensure_amnezia_dns
         sleep 5
         ensure_killswitch_dns
+        ensure_amnezia_dns
     fi
     exit 0
 }
@@ -417,6 +518,34 @@ LISTING
         echo "PASS  [killswitch] killswitch_missing_dns reports exactly the corporate servers absent from the pf table"
     else
         echo "FAIL  [killswitch] killswitch_missing_dns gave an unexpected result"
+        fail=1
+    fi
+
+    scutil_sample='<dictionary> {
+  DomainName : lan
+  SearchDomains : <array> {
+    0 : corp.example
+    1 : intra.example
+  }
+  ServerAddresses : <array> {
+    0 : 1.1.1.1
+    1 : 1.0.0.1
+  }
+}'
+    if [ "$(printf '%s\n' "$scutil_sample" | scutil_array ServerAddresses)" = "1.1.1.1 1.0.0.1" ] && \
+       [ "$(printf '%s\n' "$scutil_sample" | scutil_array SearchDomains)" = "corp.example intra.example" ] && \
+       [ -z "$(printf '%s\n' "$scutil_sample" | scutil_array SupplementalMatchDomains)" ]; then
+        echo "PASS  [amnezia-dns] scutil_array reads array members and returns empty for an absent key"
+    else
+        echo "FAIL  [amnezia-dns] scutil_array parsed the sample incorrectly"
+        fail=1
+    fi
+    if [ "$(list_minus "1.0.0.1 1.1.1.1 10.0.0.53 10.0.1.53" "10.0.0.53 10.0.1.53")" = "1.0.0.1 1.1.1.1" ] && \
+       [ -z "$(list_minus "10.0.0.53" "10.0.0.53 10.0.1.53")" ] && \
+       [ "$(list_minus "corp.example intra.example" "lan")" = "corp.example intra.example" ]; then
+        echo "PASS  [amnezia-dns] list_minus derives Amnezia's resolvers from the Kill Switch table and the missing search domains"
+    else
+        echo "FAIL  [amnezia-dns] list_minus gave an unexpected result"
         fail=1
     fi
 
