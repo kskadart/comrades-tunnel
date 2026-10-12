@@ -1184,6 +1184,19 @@ REGISTRY_DIFF_HAD_TIMESTAMP=$2
 REGISTRY_DIFF_DID_RUN=0
 REGISTRY_DIFF_PERSIST_NOW=0
 
+# A comparison made while DNS is dead compares the current list against one
+# regenerated without most of its domains: on 2026-10-09 16:09, inside the
+# AmneziaVPN DNS outage (see dns-guard.sh ensure_amnezia_dns), it reported
+# "+382/-3" and a healthy rerun found no change at all. Check 5a above just
+# told us whether anything resolves this tick; if nothing did, postpone the
+# comparison -- timestamp untouched, so the next tick tries again -- instead
+# of persisting a bogus WARN for a week.
+REGISTRY_DIFF_DNS_POSTPONED=0
+if [ "$REGISTRY_DIFF_DUE" = 1 ] && [ "$SYMPTOM_ATTEMPTED" -ge 3 ] && [ "$SYMPTOM_RESOLVED" -eq 0 ]; then
+    REGISTRY_DIFF_DUE=0
+    REGISTRY_DIFF_DNS_POSTPONED=1
+fi
+
 if [ "$REGISTRY_DIFF_DUE" = 1 ]; then
     REGISTRY_DIFF_DID_RUN=1
     REGISTRY_DIFF_PERSIST_NOW=1
@@ -1231,7 +1244,9 @@ else
     [ -z "$REGISTRY_DIFF_STATUS" ] && REGISTRY_DIFF_STATUS=OK
     [ -z "$REGISTRY_DIFF_EVIDENCE" ] && REGISTRY_DIFF_EVIDENCE="сверка с реестром ещё не выполнялась"
     RD_AGE_DAYS=$(( (NOW - REGISTRY_DIFF_LAST_RUN) / 86400 ))
-    if [ $(( NOW - REGISTRY_DIFF_LAST_RUN )) -ge "$REGISTRY_DIFF_INTERVAL_SECONDS" ]; then
+    if [ "$REGISTRY_DIFF_DNS_POSTPONED" = 1 ]; then
+        REGISTRY_DIFF_EVIDENCE="$REGISTRY_DIFF_EVIDENCE (срок настал, но DNS в этом тике не отвечает -- сверка отложена до следующего тика)"
+    elif [ $(( NOW - REGISTRY_DIFF_LAST_RUN )) -ge "$REGISTRY_DIFF_INTERVAL_SECONDS" ]; then
         REGISTRY_DIFF_EVIDENCE="$REGISTRY_DIFF_EVIDENCE (срок настал ${RD_AGE_DAYS}д назад, но $SITES_FILE ещё не создан или моложе суток -- сверка отложена)"
     else
         REGISTRY_DIFF_EVIDENCE="$REGISTRY_DIFF_EVIDENCE (последняя проверка ${RD_AGE_DAYS}д назад; раз в 7 дней)"
