@@ -386,6 +386,152 @@ def resolve_corp_host(host: str, timeout: float, fallback_dns: str, cache_dir: P
     return [], "fail"
 
 
+def asn_expansion_for_ip(domain: str, override, probe_ip: str, args, ru_asns, ripestat_dir: Path):
+    """Whole-ASN expansion decision for ONE address of a direct-domains.txt
+    entry: (asn_list, holder, mode, asn_prefix_nets, fell_back). This is the
+    former inline per-domain logic, unchanged, applied to `probe_ip`; main()
+    now calls it for every address in the domain's recent history (see
+    direct_ip_history), not only the first address of the current answer."""
+    ips = [probe_ip]
+    asn_list = []
+    holder = "-"
+    asn_prefix_nets = []  # whole-ASN prefix networks added for this address
+    mode = "ip"
+    fell_back = False
+
+    if args.no_asn or not ips:
+        mode = "ip"
+    else:
+        first_ip = ips[0]
+        ni = None
+        try:
+            ni = fetch_cached_json(
+                NETWORK_INFO_URL.format(ip=first_ip),
+                ripestat_dir / f"network-info-{first_ip}.json",
+                args.refresh,
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort, fall back
+            print(f"WARNING: failed to fetch network-info for '{domain}' ({first_ip}): {exc}")
+            # This failure always leaves mode == "ip" below (ni stays None),
+            # regardless of whether a stale cache file happens to still be
+            # on disk -- it is never read as a substitute here, so count it.
+            fell_back = True
+
+        if ni:
+            data = ni.get("data", {})
+            asn_list = data.get("asns") or []
+            # network-info does not return a holder name -- fetch it
+            # separately (as-overview), cached per ASN. Best-effort: a
+            # failure here only prints '-' and never changes 'mode'.
+            if asn_list:
+                holder = as_holder(asn_list[0], args.refresh, ripestat_dir)
+
+            if override == "asn":
+                mode = "asn"
+            elif override == "ip":
+                mode = "ip"
+            else:
+                # Auto mode: whole-ASN only when safe (RU country, under cap).
+                if asn_list:
+                    primary = asn_list[0]
+                    country = asn_country(primary, ru_asns)
+                    # Need the primary's prefix count to enforce the cap.
+                    try:
+                        n_primary = len(
+                            announced_prefixes(primary, args.refresh, ripestat_dir)
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"WARNING: failed to fetch announced-prefixes for AS{primary} ('{domain}'): {exc}")
+                        # This failure always forces mode == "ip" below (cap
+                        # treated as exceeded), regardless of a stale cache
+                        # file on disk -- it is never read as a substitute
+                        # here, so count it.
+                        fell_back = True
+                        n_primary = ASN_MAX_PREFIXES + 1  # treat as over-cap
+                    if country == "RU" and n_primary <= ASN_MAX_PREFIXES:
+                        mode = "asn"
+                    else:
+                        mode = "ip"
+                else:
+                    mode = "ip"
+        else:
+            # Could not obtain network-info and no cache -> stay IP-only.
+            mode = "ip"
+            if fell_back:
+                pass  # already marked
+
+        if mode == "asn":
+            for asn in asn_list:
+                asn_cc = asn_country(asn, ru_asns)
+                if override == "asn":
+                    pass  # force whole-ASN, ignore cap/country rule
+                else:
+                    if asn_cc != "RU":
+                        continue
+                    try:
+                        if len(announced_prefixes(asn, args.refresh, ripestat_dir)) > ASN_MAX_PREFIXES:
+                            continue
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"WARNING: failed to fetch announced-prefixes for AS{asn} ('{domain}'): {exc}")
+                        continue
+                try:
+                    for net in announced_prefixes(asn, args.refresh, ripestat_dir):
+                        asn_prefix_nets.append(net)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"WARNING: failed to fetch announced-prefixes for AS{asn} ('{domain}'): {exc}")
+                    continue
+            # If we forced 'asn' but nothing could be added, degrade to IP.
+            if not asn_prefix_nets and not (ips):
+                mode = "ip"
+            elif not asn_prefix_nets:
+                # No ASN prefixes added (e.g. resolver gave none) -- still
+                # keep the resolved /32s; that is the useful part.
+                pass
+
+    return asn_list, holder, mode, asn_prefix_nets, fell_back
+
+
+# How long a direct-domains.txt address stays "known" after it was last
+# returned by DNS. Geo/load-balanced DNS (2gis.ru: AS197482 at one network,
+# AS57724 at another) returns ONE address at a time, and which one depends
+# on where you are; expanding only the current answer made every
+# regeneration drop whichever ASN was not answering at that moment, so the
+# domain went through the personal VPN on the other network.
+IP_HISTORY_SECONDS = 30 * 24 * 3600
+
+
+def direct_ip_history(cache_dir: Path, domain: str, current_ips: list, previous) -> list:
+    """Merge `current_ips` (now) and `previous` -- the (ips, resolved_at)
+    last-known-good cache read BEFORE this run's resolution overwrote it --
+    into a per-domain history of addresses seen within IP_HISTORY_SECONDS,
+    persist it, and return the addresses to exclude: the current answer
+    first, then older ones. Best-effort: an unreadable or unwritable history
+    file only means falling back to the current answer."""
+    path = cache_dir / f"{domain}.history.json"
+    now = time.time()
+    seen = {}
+    try:
+        raw = json.loads(path.read_text()).get("seen") or {}
+        seen = {ip: float(ts) for ip, ts in raw.items()}
+    except (OSError, ValueError, AttributeError, TypeError):
+        seen = {}
+    if previous:
+        prev_ips, prev_at = previous
+        for ip in prev_ips:
+            seen[ip] = max(seen.get(ip, 0.0), float(prev_at))
+    for ip in current_ips:
+        seen[ip] = now
+    seen = {ip: ts for ip, ts in seen.items()
+            if _looks_like_ipv4(ip) and now - ts < IP_HISTORY_SECONDS}
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(path, json.dumps({"host": domain, "seen": seen}))
+    except OSError as exc:
+        print(f"WARNING: failed to write address history for '{domain}': {exc}")
+    older = sorted((ip for ip in seen if ip not in current_ips), key=lambda ip: -seen[ip])
+    return list(current_ips) + older
+
+
 def resolve_direct_domain(domain: str, timeout: float, cache_dir: Path, refresh: bool, stats: dict):
     """Resolve one direct-domains.txt entry: system resolver -> last-known-
     good cache (no public fallback -- these must resolve the way the user
@@ -1084,10 +1230,12 @@ def main() -> int:
     resolution_stats = {"live": 0, "fallback": 0, "cache": 0, "failed": 0}
 
     for domain, override in domain_specs:
+        previous = dns_cache_read(dns_cache_dir, domain, IP_HISTORY_SECONDS)
         ips, domain_source = resolve_direct_domain(
             domain, args.resolve_timeout, dns_cache_dir, args.refresh, resolution_stats
         )
-        ip_nets = [ipaddress.ip_network(f"{ip}/32") for ip in ips]
+        history_ips = direct_ip_history(dns_cache_dir, domain, ips, previous)
+        ip_nets = [ipaddress.ip_network(f"{ip}/32") for ip in history_ips]
         for ip in ips:
             resolved_direct.append((domain, ip))
 
@@ -1096,95 +1244,23 @@ def main() -> int:
         asn_prefix_nets = []  # whole-ASN prefix networks added for this domain
         mode = "ip"
         fell_back = False
-
-        if args.no_asn or not ips:
-            mode = "ip"
-        else:
-            first_ip = ips[0]
-            ni = None
-            try:
-                ni = fetch_cached_json(
-                    NETWORK_INFO_URL.format(ip=first_ip),
-                    ripestat_dir / f"network-info-{first_ip}.json",
-                    args.refresh,
+        if not args.no_asn:
+            for probe_ip in history_ips:
+                probe = ipaddress.ip_address(probe_ip)
+                if any(probe in net for net in asn_prefix_nets):
+                    continue  # already covered by an ASN expanded for this domain
+                p_asns, p_holder, p_mode, p_nets, p_fell_back = asn_expansion_for_ip(
+                    domain, override, probe_ip, args, ru_asns, ripestat_dir
                 )
-            except Exception as exc:  # noqa: BLE001 - best-effort, fall back
-                print(f"WARNING: failed to fetch network-info for '{domain}' ({first_ip}): {exc}")
-                # This failure always leaves mode == "ip" below (ni stays None),
-                # regardless of whether a stale cache file happens to still be
-                # on disk -- it is never read as a substitute here, so count it.
-                fell_back = True
-
-            if ni:
-                data = ni.get("data", {})
-                asn_list = data.get("asns") or []
-                # network-info does not return a holder name -- fetch it
-                # separately (as-overview), cached per ASN. Best-effort: a
-                # failure here only prints '-' and never changes 'mode'.
-                if asn_list:
-                    holder = as_holder(asn_list[0], args.refresh, ripestat_dir)
-
-                if override == "asn":
+                for asn in p_asns:
+                    if asn not in asn_list:
+                        asn_list.append(asn)
+                if holder == "-":
+                    holder = p_holder
+                if p_mode == "asn":
                     mode = "asn"
-                elif override == "ip":
-                    mode = "ip"
-                else:
-                    # Auto mode: whole-ASN only when safe (RU country, under cap).
-                    if asn_list:
-                        primary = asn_list[0]
-                        country = asn_country(primary, ru_asns)
-                        # Need the primary's prefix count to enforce the cap.
-                        try:
-                            n_primary = len(
-                                announced_prefixes(primary, args.refresh, ripestat_dir)
-                            )
-                        except Exception as exc:  # noqa: BLE001
-                            print(f"WARNING: failed to fetch announced-prefixes for AS{primary} ('{domain}'): {exc}")
-                            # This failure always forces mode == "ip" below (cap
-                            # treated as exceeded), regardless of a stale cache
-                            # file on disk -- it is never read as a substitute
-                            # here, so count it.
-                            fell_back = True
-                            n_primary = ASN_MAX_PREFIXES + 1  # treat as over-cap
-                        if country == "RU" and n_primary <= ASN_MAX_PREFIXES:
-                            mode = "asn"
-                        else:
-                            mode = "ip"
-                    else:
-                        mode = "ip"
-            else:
-                # Could not obtain network-info and no cache -> stay IP-only.
-                mode = "ip"
-                if fell_back:
-                    pass  # already marked
-
-            if mode == "asn":
-                for asn in asn_list:
-                    asn_cc = asn_country(asn, ru_asns)
-                    if override == "asn":
-                        pass  # force whole-ASN, ignore cap/country rule
-                    else:
-                        if asn_cc != "RU":
-                            continue
-                        try:
-                            if len(announced_prefixes(asn, args.refresh, ripestat_dir)) > ASN_MAX_PREFIXES:
-                                continue
-                        except Exception as exc:  # noqa: BLE001
-                            print(f"WARNING: failed to fetch announced-prefixes for AS{asn} ('{domain}'): {exc}")
-                            continue
-                    try:
-                        for net in announced_prefixes(asn, args.refresh, ripestat_dir):
-                            asn_prefix_nets.append(net)
-                    except Exception as exc:  # noqa: BLE001
-                        print(f"WARNING: failed to fetch announced-prefixes for AS{asn} ('{domain}'): {exc}")
-                        continue
-                # If we forced 'asn' but nothing could be added, degrade to IP.
-                if not asn_prefix_nets and not (ips):
-                    mode = "ip"
-                elif not asn_prefix_nets:
-                    # No ASN prefixes added (e.g. resolver gave none) -- still
-                    # keep the resolved /32s; that is the useful part.
-                    pass
+                asn_prefix_nets.extend(p_nets)
+                fell_back = fell_back or p_fell_back
 
         if fell_back:
             fallback_count += 1
@@ -1205,7 +1281,7 @@ def main() -> int:
         asns_display = ",".join(f"AS{a}" for a in asn_list) if asn_list else "-"
         domain_records.append({
             "domain": domain,
-            "ips": ips,
+            "ips": history_ips,
             "asns": asns_display,
             "holder": holder,
             "country": country,
